@@ -1,0 +1,4 @@
+name: genienv
+channels:
+  - defaults
+prefix: /home/sdainelli/miniconda3/envs/genienv

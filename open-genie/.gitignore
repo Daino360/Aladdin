@@ -1,0 +1,11 @@
+*.vs*
+*.pytest*
+*.pyc
+*.ipynb
+
+*DS_Store*
+
+*egg*
+*log*
+*.local*
+test/.*
