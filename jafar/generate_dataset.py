@@ -15,7 +15,7 @@ import tyro
 @dataclass
 class Args:
     num_episodes: int = 10000
-    output_dir: str = "data/coinrun_episodes"
+    output_dir: str = "/andromeda/personal/sdainelli/jafar-dataset"
     min_episode_length: int = 50
 
 
