@@ -6,7 +6,7 @@ from os import makedirs
 import argparse
 from tqdm.auto import trange
 
-ROOT='path/to/data'
+ROOT='/andromeda/personal/sdainelli/genie-dataset'
 
 def save_frames_to_video(frames, output_file, fps=30):
     # Get the shape of the frame to set the video width and height
