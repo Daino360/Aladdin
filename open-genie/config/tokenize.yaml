@@ -61,7 +61,7 @@ model:
   quant_loss_weight: 1.
 
 data:
-  root: path/to/data
+  root: /andromeda/personal/sdainelli/genie-dataset
   env_name: Coinrun
   padding: none
   randomize: true
@@ -87,6 +87,6 @@ trainer:
   logger:
     - class_path: lightning.pytorch.loggers.TensorBoardLogger
       init_args:
-        save_dir: path/to/log
+        save_dir: logs
         name: genie-tokenizer
         version: null
