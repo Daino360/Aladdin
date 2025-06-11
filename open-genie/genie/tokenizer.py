@@ -410,7 +410,7 @@ class VideoTokenizer(LightningModule):
         return loss
     
     def validation_step(self, batch : Tensor, batch_idx : int) -> Tensor:
-        # Compute the validation loss
+        # Compute the validation loss ##after uploading the videos
         loss, aux_losses = self(batch)
         
         # Log the training loss

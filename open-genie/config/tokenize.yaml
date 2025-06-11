@@ -24,7 +24,7 @@ model:
         time_factor : 1
         space_factor : 2
   disc_kwargs:
-    inp_size: [64, 64] # Size of input frames
+    inp_size: [64, 64] # Size of input frames ## H x W
     model_dim: 64 # Dimension of the model
     dim_mults: [1, 2, 4] # Channel multipliers
     down_step: [null, 2, 2] # Down-sampling steps
