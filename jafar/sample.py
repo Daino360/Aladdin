@@ -21,7 +21,7 @@ class Args:
     seq_len: int = 16
     image_channels: int = 3
     image_resolution: int = 64
-    data_dir: str = "data/coinrun_episodes"
+    data_dir: str = "/andromeda/personal/sdainelli/jafar-dataset/"
     checkpoint: str = ""
     # Sampling
     batch_size: int = 1

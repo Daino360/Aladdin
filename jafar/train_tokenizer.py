@@ -21,10 +21,14 @@ from utils.dataloader import get_dataloader
 ts = int(time.time())
 
 
+"""os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"]="false"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]=".XX"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"]="platform"""
+
 @dataclass
 class Args:
     # Experiment
-    num_steps: int = 300_000
+    num_steps: int = 30_000 # era 300_000
     seed: int = 0
     seq_len: int = 16
     image_channels: int = 3
@@ -33,10 +37,10 @@ class Args:
     checkpoint: str = ""
     # Optimization
     vq_beta: float = 0.25
-    batch_size: int = 48
-    min_lr: float = 3e-4
-    max_lr: float = 3e-4
-    warmup_steps: int = 10000
+    batch_size: int = 6 # era 48
+    min_lr: float = 3e-4 # era 3e-4
+    max_lr: float = 3e-4 # era 3e-4
+    warmup_steps: int = 1000 #era 10_000
     # Tokenizer
     model_dim: int = 512
     latent_dim: int = 32
@@ -47,13 +51,13 @@ class Args:
     dropout: float = 0.0
     codebook_dropout: float = 0.01
     # Logging
-    log: bool = False
+    log: bool = True # era False e non salvava i checkpoints
     entity: str = ""
     project: str = ""
     log_interval: int = 5
     log_image_interval: int = 250
     ckpt_dir: str = ""
-    log_checkpoint_interval: int = 10000
+    log_checkpoint_interval: int = 1000 # era 10000
     log_gradients: bool = False
 
 

@@ -1,0 +1,81 @@
+batch_size: 32
+collate_fn: null
+d_codebook: 10
+dec_desc: !!python/tuple
+- !!python/tuple
+  - space-time_attn
+  - d_head: 64
+    n_head: 8
+- !!python/tuple
+  - depth2spacetime_upsample
+  - in_channels: 64
+    kernel_size: 3
+    out_channels: 3
+    space_factor: 2
+    time_factor: 1
+disc_kwargs:
+  act_fn: leaky
+  dim_head: 32
+  dim_mults:
+  - 1
+  - 2
+  - 4
+  down_step:
+  - null
+  - 2
+  - 2
+  inp_channels: 3
+  inp_size:
+  - 64
+  - 64
+  kernel_size: 3
+  model_dim: 64
+  num_groups: 8
+  num_heads: 4
+  use_attn: true
+  use_blur: true
+enc_desc: !!python/tuple
+- !!python/tuple
+  - spacetime_downsample
+  - in_channels: 3
+    kernel_size: 3
+    out_channels: 64
+    space_factor: 2
+    time_factor: 1
+- !!python/tuple
+  - space-time_attn
+  - d_head: 64
+    n_head: 8
+env_name: Coinrun
+gan_discriminate: frames
+gan_frames_per_batch: 4
+gan_loss_weight: 1.0
+lfq_bias: true
+lfq_commit_weight: 0.25
+lfq_diversity_weight: 1.0
+lfq_entropy_weight: 0.01
+lfq_frac_sample: 1.0
+n_codebook: 1
+num_frames: 64
+num_workers: 0
+optimizer: !!python/name:jsonargparse._typehints.partial_instance ''
+output_format: c t h w
+padding: none
+perc_feat_layers:
+- features.6
+- features.13
+- features.18
+- features.25
+perc_loss_weight: 1.0
+perceptual_model: vgg16
+quant_loss_weight: 1.0
+randomize: true
+root: /andromeda/personal/sdainelli/genie-dataset
+test_sampler: null
+train_sampler: null
+train_shuffle: null
+transform: null
+val_batch_size: null
+val_sampler: null
+val_shuffle: null
+worker_init_fn: null

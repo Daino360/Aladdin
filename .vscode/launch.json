@@ -1,0 +1,40 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+
+
+
+        {
+            "name": "Python Genie Debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/home/sdainelli/open-genie/tokenizer.py",
+            "args": ["fit", "-c", "open-genie/config/tokenize.yaml"],
+            "console": "integratedTerminal",
+            "justMyCode": true // to skip library code
+        },
+        
+        {
+            "name": "Python Jafar-tokenizer Debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/home/sdainelli/jafar/distributed_train_tokenizer.py",
+            "args": ["--ckpt_dir", "./checkpoints/c_tokenizer"],
+            "console": "integratedTerminal",
+            "justMyCode": true // to skip library code
+        },
+        
+        {
+            "name": "Python Jafar-dynamics Debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/home/sdainelli/jafar/train_dynamics.py",
+            "args": ["--tokenizer_checkpoint","/home/sdainelli/jafar/checkpoints/c_tokenizer/tokenizer_1750188653_3000", "--lam_checkpoint", "/home/sdainelli/jafar/checkpoints/c_lam/lam_1750235884_2000"],
+            "console": "integratedTerminal",
+            "justMyCode": true // to skip library code
+        }
+    ]
+}

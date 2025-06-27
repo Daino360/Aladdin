@@ -1,0 +1,168 @@
+# lightning.pytorch==2.2.4
+seed_everything: 31415
+trainer:
+  accelerator: gpu
+  strategy: ddp_find_unused_parameters_false
+  devices: 1
+  num_nodes: 1
+  precision: 16-mixed
+  logger:
+  - class_path: lightning.pytorch.loggers.TensorBoardLogger
+    init_args:
+      save_dir: logs
+      name: genie-tokenizer
+      version: null
+      log_graph: false
+      default_hp_metric: true
+      prefix: ''
+      sub_dir: null
+      comment: ''
+      purge_step: null
+      max_queue: 10
+      flush_secs: 120
+      filename_suffix: ''
+  callbacks:
+  - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+    init_args:
+      dirpath: null
+      filename: null
+      monitor: val_loss
+      verbose: false
+      save_last: true
+      save_top_k: 1
+      save_weights_only: false
+      mode: min
+      auto_insert_metric_name: true
+      every_n_train_steps: null
+      train_time_interval: null
+      every_n_epochs: null
+      save_on_train_epoch_end: null
+      enable_version_counter: true
+  fast_dev_run: false
+  max_epochs: 40
+  min_epochs: null
+  max_steps: -1
+  min_steps: null
+  max_time: null
+  limit_train_batches: null
+  limit_val_batches: 32
+  limit_test_batches: null
+  limit_predict_batches: null
+  overfit_batches: 0.0
+  val_check_interval: 32
+  check_val_every_n_epoch: 1
+  num_sanity_val_steps: null
+  log_every_n_steps: 16
+  enable_checkpointing: null
+  enable_progress_bar: null
+  enable_model_summary: null
+  accumulate_grad_batches: 1
+  gradient_clip_val: null
+  gradient_clip_algorithm: null
+  deterministic: null
+  benchmark: null
+  inference_mode: true
+  use_distributed_sampler: true
+  profiler: null
+  detect_anomaly: false
+  barebones: false
+  plugins: null
+  sync_batchnorm: false
+  reload_dataloaders_every_n_epochs: 0
+  default_root_dir: null
+model:
+  enc_desc:
+  - - spacetime_downsample
+    - in_channels: 3
+      kernel_size: 3
+      out_channels: 64
+      time_factor: 1
+      space_factor: 2
+  - - space-time_attn
+    - n_head: 8
+      d_head: 64
+  dec_desc:
+  - - space-time_attn
+    - n_head: 8
+      d_head: 64
+  - - depth2spacetime_upsample
+    - in_channels: 64
+      kernel_size: 3
+      out_channels: 3
+      time_factor: 1
+      space_factor: 2
+  disc_kwargs:
+    inp_size:
+    - 64
+    - 64
+    model_dim: 64
+    dim_mults:
+    - 1
+    - 2
+    - 4
+    down_step:
+    - null
+    - 2
+    - 2
+    inp_channels: 3
+    kernel_size: 3
+    num_groups: 8
+    act_fn: leaky
+    use_blur: true
+    use_attn: true
+    num_heads: 4
+    dim_head: 32
+  d_codebook: 10
+  n_codebook: 1
+  lfq_bias: true
+  lfq_frac_sample: 1.0
+  lfq_commit_weight: 0.25
+  lfq_entropy_weight: 0.01
+  lfq_diversity_weight: 1.0
+  optimizer:
+    class_path: torch.optim.AdamW
+    init_args:
+      lr: 0.001
+      betas:
+      - 0.9
+      - 0.999
+      eps: 1.0e-08
+      weight_decay: 0.01
+      amsgrad: false
+      maximize: false
+      foreach: null
+      capturable: false
+      differentiable: false
+      fused: null
+  perceptual_model: vgg16
+  perc_feat_layers:
+  - features.6
+  - features.13
+  - features.18
+  - features.25
+  gan_discriminate: frames
+  gan_frames_per_batch: 4
+  gan_loss_weight: 1.0
+  perc_loss_weight: 1.0
+  quant_loss_weight: 1.0
+data:
+  root: /andromeda/personal/sdainelli/genie-dataset
+  env_name: Coinrun
+  padding: none
+  randomize: true
+  transform: null
+  num_frames: 64
+  output_format: c t h w
+  batch_size: 32
+  num_workers: 0
+  train_shuffle: null
+  val_shuffle: null
+  val_batch_size: null
+  worker_init_fn: null
+  collate_fn: null
+  train_sampler: null
+  val_sampler: null
+  test_sampler: null
+optimizer: null
+lr_scheduler: null
+ckpt_path: null
