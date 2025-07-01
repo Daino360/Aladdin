@@ -33,11 +33,12 @@ class Args:
     seq_len: int = 16
     image_channels: int = 3
     image_resolution: int = 64
-    data_dir: str = "/andromeda/personal/sdainelli/jafar-dataset/"
+    # data_dir: str = "/andromeda/personal/sdainelli/jafar-dataset/" # su harlock
+    data_dir: str = "./dataset" # su chichi
     checkpoint: str = ""
     # Optimization
     vq_beta: float = 0.25
-    batch_size: int = 6 # era 48
+    batch_size: int = 48 # era 48
     min_lr: float = 3e-4 # era 3e-4
     max_lr: float = 3e-4 # era 3e-4
     warmup_steps: int = 1000 #era 10_000

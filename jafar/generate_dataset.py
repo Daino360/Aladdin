@@ -15,7 +15,8 @@ import tyro
 @dataclass
 class Args:
     num_episodes: int = 10000
-    output_dir: str = "/andromeda/personal/sdainelli/jafar-dataset"
+    #output_dir: str = "/andromeda/personal/sdainelli/jafar-dataset" # Per girare su harlock
+    output_dir: str = "./dataset" # Per girare su Chichi
     min_episode_length: int = 50
 
 
