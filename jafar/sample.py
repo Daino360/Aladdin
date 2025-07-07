@@ -13,6 +13,8 @@ import tyro
 from genie import Genie
 from utils.dataloader import get_dataloader
 
+# Set JAX to use CPU for reproducibility #
+# jax.config.update('jax_platform_name', 'cpu')
 
 @dataclass
 class Args:
@@ -21,7 +23,8 @@ class Args:
     seq_len: int = 16
     image_channels: int = 3
     image_resolution: int = 64
-    data_dir: str = "/andromeda/personal/sdainelli/jafar-dataset/"
+    #data_dir: str = "/andromeda/personal/sdainelli/jafar-dataset/" # for harlock
+    data_dir: str = "./dataset" # for chichi
     checkpoint: str = ""
     # Sampling
     batch_size: int = 1

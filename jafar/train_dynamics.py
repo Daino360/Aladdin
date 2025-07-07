@@ -22,16 +22,17 @@ ts = int(time.time())
 @dataclass
 class Args:
     # Experiment
-    num_steps: int = 20000 # era 200_000
+    num_steps: int = 20_000 # era 200_000
     seed: int = 0
     seq_len: int = 16
     image_channels: int = 3
     image_resolution: int = 64
-    data_dir: str = "/andromeda/personal/sdainelli/jafar-dataset/"
+    # data_dir: str = "/andromeda/personal/sdainelli/jafar-dataset/" # per harlock
+    data_dir: str = "./dataset" #per chichi
     # Optimization
-    batch_size: int = 6 # era 36
-    min_lr: float = 3e-7 # era 3e-6
-    max_lr: float = 3e-6 # era 3e-5
+    batch_size: int = 36 # era 36
+    min_lr: float = 3e-6 # era 3e-6
+    max_lr: float = 3e-5 # era 3e-5
     warmup_steps: int = 500 # era 5000
     # Tokenizer
     tokenizer_dim: int = 512
@@ -62,7 +63,7 @@ class Args:
     log_interval: int = 5
     log_image_interval: int = 250
     ckpt_dir: str = ""
-    log_checkpoint_interval: int = 2500# era 25000
+    log_checkpoint_interval: int = 2500 # era 25000
     log_gradients: bool = False
 
 
