@@ -35,6 +35,16 @@
             "args": ["--tokenizer_checkpoint","/home/sdainelli/jafar/checkpoints/c_tokenizer/tokenizer_1750188653_3000", "--lam_checkpoint", "/home/sdainelli/jafar/checkpoints/c_lam/lam_1750235884_2000"],
             "console": "integratedTerminal",
             "justMyCode": true // to skip library code
+        },
+
+        {
+            "name": "Python GenieRedux Debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/home/sdainelli/Aladdin/GenieRedux/main.py",
+            "args": ["+config=genie_redux.yaml","++config.train.batch_size=3","++config.train.grad_accum=4","++train.num_processes=1"],
+            "console": "integratedTerminal",
+            "justMyCode": true // to skip library code
         }
     ]
 }
