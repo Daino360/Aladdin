@@ -60,6 +60,8 @@ def run(args):
         cache_dpath=f"{cache_dpath}/cache/{args.train.dataset_name}",
     )
 
+    # print("Number of training samples:", len(train_ds)) # ADDEDBYME
+
     valid_ds = EnvironmentDataset(
         dataset_folder,
         seq_length_input=args.train.num_frames - 1,

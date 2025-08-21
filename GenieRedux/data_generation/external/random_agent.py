@@ -63,7 +63,8 @@ def create_act_model(sess, env, nenvs):
 
 def ppo_init(is_high_difficulty=True, is_high_res=True, should_paint_velocity=False, seed_ids = [0]):
     from coinrun.config import Config
-    Config.WORKDIR = './external/coinrun/coinrun/saved_models'
+    # Config.WORKDIR = './external/coinrun/coinrun/saved_models'
+    Config.WORKDIR = './external/coinrun/saved_models'
     setup_utils.setup_and_load(restore_id="myrun", use_cmd_line_args=False, num_levels=10000, high_difficulty=is_high_difficulty, is_high_res=is_high_res, paint_vel_info=should_paint_velocity, set_seed=seed_ids[0])
 
 def ppo_agent_generator(num_envs=1, max_steps=100000, is_high_difficulty=True, is_high_res=True, should_paint_velocity=False, seed_ids = [0]):

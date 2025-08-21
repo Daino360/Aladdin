@@ -57,8 +57,8 @@ class CoinRunConnector(BaseConnector):
             action = acts[0]
             session_end = frame_id == n_steps_max - 1
             if self.image_size is not None:
+                # self.image_size = tuple(self.image_size)  # Convert list to tuple #ADDEDBYME
                 frame = cv2.resize(frame, self.image_size)
-
             if _dones[0]:
                 break
 

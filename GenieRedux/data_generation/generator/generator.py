@@ -8,6 +8,21 @@ import json
 from tqdm import tqdm
 from generator.connector_base import BaseConnector
 
+import numpy as np #ADDEDBYME
+
+# Class ADDEDBYME
+# Custom JSON Encoder to handle NumPy data types
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        elif isinstance(obj, np.floating):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        # Let the base class default method raise the TypeError for any other type
+        return json.JSONEncoder.default(self, obj)
+
 multiprocessing.set_start_method('spawn', force=True)
 
 class DatasetFileStructure:
@@ -150,7 +165,8 @@ class EnvironmentDataGenerator:
                 instance_id, session_id=session_id, make_dirs=True
             )
             with open(actions_fpath, "w") as f:
-                json.dump({"actions": actions}, f)
+                #json.dump({"actions": actions}, f)
+                json.dump({"actions": actions}, f, cls=NumpyEncoder) #ADDEDBYME
 
     def generate(self):
         os.makedirs(self.fs.data_dpath, exist_ok=True)
