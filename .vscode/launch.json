@@ -45,6 +45,15 @@
             "args": ["+config=genie_redux.yaml","++config.train.batch_size=3","++config.train.grad_accum=4","++train.num_processes=1"],
             "console": "integratedTerminal",
             "justMyCode": true // to skip library code
+        },
+                {
+            "name": "Python Coinrun Debug",
+            //"type": "debugpy",
+            "request": "launch",
+            "program": "/home/sdainelli/Aladdin/GenieRedux/data_generation/external/coinrun/coinrun/train_agent.py",
+            "args": ["--run-id myrun","--save-interval 1"],
+            "console": "integratedTerminal",
+            "justMyCode": true // to skip library code
         }
     ]
 }

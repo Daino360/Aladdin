@@ -14,8 +14,8 @@ optimizer:
 train:
   dataset_root_dpath: ???
   dataset_name: ???
-  batch_size: 8 #6
-  grad_accum: 2 #1
+  batch_size: 6
+  grad_accum: 1
   num_train_steps: 25000 #150000
   num_frames: 16
   sample_num_frames: 15
@@ -28,7 +28,7 @@ train:
   wandb_dpath: "./logs/wandb"
   wandb_mode: "online"
   wandb_project: "GenieRedux"
-  wandb_name: "genie_redux_fast" #"genie_redux"
+  wandb_name: "genie_redux_fast2" #"genie_redux"
 
 eval:
   dataset_root_dpath: ???
