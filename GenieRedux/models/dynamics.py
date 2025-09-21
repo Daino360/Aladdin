@@ -1,14 +1,15 @@
-import math
 import functools
+import math
 
 import torch
 import torch.nn.functional as F
+from einops import pack, rearrange, unpack
 from torch import nn
 
-from einops import rearrange, pack, unpack
+from .components.attention import ContinuousPositionBias, STTransformer
+from tools.logger import getLogger
 
-from models.components.attention import STTransformer, ContinuousPositionBias
-
+log = getLogger(__name__)
 
 # helpers
 
@@ -55,7 +56,7 @@ def uniform(shape, device):
 
 
 # tensor helper functions
-def log(t, eps=1e-10):
+def logarithm(t, eps=1e-10):
     return torch.log(t + eps)
 
 
@@ -94,7 +95,7 @@ def gumbel_noise(t):
         torch.Tensor: Gumbel noise with the same shape as the input tensor.
     """
     noise = torch.zeros_like(t).uniform_(0, 1)
-    return -log(-log(noise))
+    return -logarithm(-logarithm(noise))
 
 
 def gumbel_sample(t, temperature=1.0, dim=-1):
@@ -160,9 +161,90 @@ def mask_ratio_schedule(ratio, total_unknown, method="cosine"):
     return mask_ratio
 
 
-class MaskGit(nn.Module):
+class FocalLoss(nn.Module):
+    def __init__(self, gamma=2, reduction="mean"):
+        super().__init__()
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets, alpha=1):
+        ce_loss = F.cross_entropy(inputs, targets, reduction="none")
+        pt = torch.exp(-ce_loss)
+        loss = alpha * ((1 - pt) ** self.gamma) * ce_loss
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        else:
+            return loss
+
+
+class DistanceWeightedCrossEntropyLoss(nn.Module):
+    def __init__(self, codebook, _lamda=1):
+        super(DistanceWeightedCrossEntropyLoss, self).__init__()
+        self.pairwise_distances = self._compute_pairwise_distances(codebook)
+        self._lamda = _lamda
+
+    def _compute_pairwise_distances(self, x):
+        """Computes the pairwise cosine distance matrix for a set of vectors (codebook)."""
+
+        with torch.no_grad():
+            # Normalize each vector to unit length (L2 normalization)
+            x_normalized = F.normalize(
+                x, p=2, dim=1
+            )  # Shape: (num_classes, vector_dim)
+
+            # Compute the cosine similarity matrix
+            cosine_similarity = torch.mm(
+                x_normalized, x_normalized.T
+            )  # Shape: (num_classes, num_classes)
+
+            # Convert cosine similarity to cosine distance
+            cosine_distance = 1 - cosine_similarity
+
+        return cosine_distance.detach()
+
+    def forward(self, predictions, target_indices):
+        """
+        Computes the custom cross-entropy loss with inverse distance-based coefficients.
+
+        Args:
+            predictions (torch.Tensor): Logits from the model (batch_size, num_classes).
+            target_indices (torch.Tensor): Ground truth indices (batch_size,).
+
+        Returns:
+            torch.Tensor: The computed loss.
+        """
+
+        # Device assignment for compatibility
+        device = predictions.device
+
+        # Ensure pairwise_distances is on the correct device
+        pairwise_distances = self.pairwise_distances.to(device)
+
+        # Select the distances corresponding to the target indices without looping
+        distances = pairwise_distances[target_indices]
+
+        # apply softmax to predictions
+        softmax_predictions = F.softmax(predictions, dim=1)
+
+        # Compute the distance-weighted penalty
+        distance_weighted_penalty = torch.mean(
+            torch.sum(distances * softmax_predictions, dim=1)
+        )
+
+        # debug("distance_weighted_penalty", distance_weighted_penalty)
+
+        # Compute the final loss
+        loss = self._lamda * distance_weighted_penalty
+
+        return loss
+
+
+class MaskGIT(nn.Module):
     """
-    MaskGit model for video token prediction.
+    MaskGIT model for video token prediction with token distance loss for training.
 
     This model uses a transformer architecture to predict video tokens based on
     masked input and action tokens.
@@ -197,6 +279,7 @@ class MaskGit(nn.Module):
         image_size=128,
         patch_size=8,
         num_blocks=8,
+        use_token=True,
         *args,
         **kwargs,
     ):
@@ -220,25 +303,33 @@ class MaskGit(nn.Module):
             **kwargs: Additional keyword arguments.
         """
 
-        assert not is_guided or exists(
-            action_dim
-        ), "Action dim must be provided for guided dynamics"
-
-        if not is_guided:
-            action_dim = 0
+        assert not is_guided or exists(action_dim), (
+            "Action dim must be provided for guided dynamics"
+        )
 
         super().__init__()
         self.dim = dim
         self.action_dim = action_dim
+        self.action_dim_effective = action_dim
+        self.use_token = use_token
+
+        if not is_guided:
+            self.action_dim_effective = 0
 
         self.image_size = pair(image_size)
         self.patch_size = pair(patch_size)
 
         self.mask_id = num_tokens
         self.is_guided = is_guided
+
+        # learnable token for the masked token
         self.token_emb = nn.Embedding(
             num_tokens + 1, dim
         )  # last token is used as mask_id
+
+        self.mask_token_template = torch.zeros(
+            (self.dim)
+        )
 
         self.max_seq_len = max_seq_len
         self.pos_emb = nn.Embedding(max_seq_len, dim)
@@ -250,7 +341,7 @@ class MaskGit(nn.Module):
         )
 
         transformer_kwargs = dict(
-            dim=dim + action_dim,
+            dim=dim + self.action_dim_effective,
             dim_head=dim_head,
             heads=heads,
             attn_dropout=attn_dropout,
@@ -264,7 +355,7 @@ class MaskGit(nn.Module):
 
         self.transformer = STTransformer(order="st", **transformer_kwargs)
 
-        self.to_logits = nn.Linear(dim + action_dim, num_tokens)
+        self.to_logits = nn.Linear(dim + self.action_dim_effective, num_tokens)
 
         # wandb config
         config = {}
@@ -292,9 +383,11 @@ class MaskGit(nn.Module):
         self,
         video_tokens_ids,
         actions,
+        prompt_tokens=None,
         video_mask=None,
         video_patch_shape=None,
         return_embeds=False,
+        tokenizer=None,
         **kwargs,
     ):
         """
@@ -317,7 +410,9 @@ class MaskGit(nn.Module):
         assert video_tokens_ids.ndim in {
             2,
             4,
-        }, "video token ids must be of shape (batch, seq) or (batch, frame, height, width)"
+        }, (
+            "video token ids must be of shape (batch, seq) or (batch, frame, height, width)"
+        )
 
         if video_tokens_ids.ndim == 4:
             video_patch_shape = video_tokens_ids.shape[1:]
@@ -332,12 +427,28 @@ class MaskGit(nn.Module):
         rel_pos_bias = self.continuous_pos_bias(h, w, device=device)
 
         video_shape = (b, t, h, w)
+        mask = video_tokens_ids == self.mask_id
 
-        video_tokens = self.token_emb(video_tokens_ids)
+        if self.use_token:
+            if tokenizer is None:
+                raise ValueError("Tokenizer must be provided when use_token is True")
 
-        assert (
-            n <= self.max_seq_len
-        ), f"the video token sequence length you are passing in ({n}) is greater than the `max_seq_len` ({self.max_seq_len}) set on your `MaskGit`"
+            with torch.no_grad():
+                video_tokens_ids_zeroed = torch.where(mask, 0, video_tokens_ids)
+                codes = tokenizer.vq.codebook[video_tokens_ids_zeroed]
+                codes = tokenizer.vq.project_out(codes)
+
+            mask_token_template = self.mask_token_template.to(device).type_as(codes)
+            video_tokens = codes.clone() * 10
+            video_tokens[mask] = mask_token_template.unsqueeze(0)
+
+            video_tokens = self.token_emb(video_tokens_ids) + video_tokens
+        else:
+            video_tokens = self.token_emb(video_tokens_ids)
+
+        assert n <= self.max_seq_len, (
+            f"the video token sequence length you are passing in ({n}) is greater than the `max_seq_len` ({self.max_seq_len}) set on your `MaskGit`"
+        )
         video_tokens = self.pos_emb(torch.arange(n, device=device)) + video_tokens
 
         video_tokens = (
@@ -355,6 +466,7 @@ class MaskGit(nn.Module):
             actions = actions.unsqueeze(2).unsqueeze(2).expand(-1, -1, h, w, -1)
             video_action_tokens = torch.cat([video_tokens, actions], dim=-1)
         else:
+            actions = actions.expand(-1, -1, h, w, -1)
             video_action_tokens = video_tokens + actions
 
         pattern = "b t h w d"
@@ -392,29 +504,86 @@ class Dynamics(nn.Module):
 
     Args:
         maskgit (GenieMaskGit): The GenieMaskGit model for token prediction.
-        inference_steps (int): Number of steps for inference.
         sample_temperature (float): Temperature for sampling.
-        mask_schedule (str): Schedule for masking tokens.
     """
 
     def __init__(
         self,
         *,
-        maskgit: MaskGit,
-        inference_steps=25,
+        maskgit: MaskGIT,
+        tokenizer_codebook=None,
+        inference_steps=1,
         sample_temperature=1.0,
         mask_schedule="cosine",
+        use_cross_entropy_loss=True,
+        use_focal_loss=False,
+        use_distance_weighted_loss=False,
     ):
+        assert use_cross_entropy_loss != use_focal_loss, (
+            "Only one CE loss function can be used at a time"
+        )
+
         super().__init__()
 
         self.maskgit = maskgit
         self.mask_id = maskgit.mask_id
+        self.inference_steps = (inference_steps,)
+        self.sample_temperature = (sample_temperature,)
+        self.mask_schedule = (mask_schedule,)
+        self.use_cross_entropy_loss = use_cross_entropy_loss
+        self.use_focal_loss = use_focal_loss
+        self.use_distance_weighted_loss = use_distance_weighted_loss
 
-        # Sampling parameters
-        self.mask_schedule = mask_schedule
+        self.focal_loss = FocalLoss(gamma=2.0)
 
-        self.inference_steps = inference_steps
-        self.sample_temperature = sample_temperature
+        if use_distance_weighted_loss:
+            self.distance_weighted_loss = DistanceWeightedCrossEntropyLoss(
+                tokenizer_codebook, _lamda=3
+            )
+
+    def loss_function(self, logits, target_indices, accelerator_tracker_dict=None):
+        loss = 0
+        use_loss_tracking = accelerator_tracker_dict is not None
+
+        if use_loss_tracking:
+            tracker = accelerator_tracker_dict["tracker"]
+            step = accelerator_tracker_dict["step"]
+            use_loss_tracking = step % 50 == 0
+
+        if self.use_cross_entropy_loss:
+            ce_loss = F.cross_entropy(logits, target_indices)
+            if use_loss_tracking:
+                tracker.log(
+                    {
+                        "Train Cross Entropy Loss": ce_loss.item(),
+                    },
+                    step=step,
+                )
+            loss += ce_loss
+
+        if self.use_focal_loss:
+            focal_loss = self.focal_loss(logits, target_indices, alpha=2)
+            if use_loss_tracking:
+                tracker.log(
+                    {
+                        "Train Focal Loss": focal_loss.item(),
+                    },
+                    step=step,
+                )
+            loss += focal_loss
+
+        if self.use_distance_weighted_loss:
+            dw_loss = self.distance_weighted_loss(logits, target_indices)
+            if use_loss_tracking:
+                tracker.log(
+                    {
+                        "Train Distance Weighted Loss": dw_loss.item(),
+                    },
+                    step=step,
+                )
+            loss += dw_loss
+
+        return loss
 
     def accelator_log(self, accelerator_tracker_dict, loss):
         """
@@ -432,7 +601,7 @@ class Dynamics(nn.Module):
             mode = "Train" if train else "Validation"
             tracker.log(
                 {
-                    f"{mode} Dynamics cross entropy loss": loss.item(),
+                    f"{mode} Total Loss": loss.item(),
                 },
                 step=step,
             )
@@ -469,10 +638,17 @@ class Dynamics(nn.Module):
     @torch.no_grad()
     def sample(
         self,
-        prime_token_ids=None,
+        prime_token_ids=None,  # B x C x T x H x W
         actions=None,
+        prompt_tokens=None,
         num_tokens=None,
         patch_shape=None,
+        inference_steps=None,
+        mask_schedule=None,
+        sample_temperature=None,
+        return_confidence=False,
+        return_logits=False,
+        tokenizer=None,
         *args,
         **kwargs,
     ):
@@ -487,6 +663,13 @@ class Dynamics(nn.Module):
         Returns:
             torch.Tensor: Generated video frames.
         """
+
+        if not exists(inference_steps):
+            inference_steps = self.inference_steps
+        if not exists(sample_temperature):
+            sample_temperature = self.sample_temperature
+        if not exists(mask_schedule):
+            mask_schedule = self.mask_schedule
 
         assert exists(prime_token_ids), "prime_token_ids must be provided"
         assert exists(actions), "actions must be provided"
@@ -505,16 +688,15 @@ class Dynamics(nn.Module):
         mask = torch.ones(shape, device=device, dtype=torch.bool)
 
         scores = None
-        for step in range(self.inference_steps):
+        all_scores = []
+        for step in range(inference_steps):
             is_first_step = step == 0
-            is_last_step = step == self.inference_steps - 1
-            steps_til_x0 = self.inference_steps - (step + 1)
+            is_last_step = step == inference_steps - 1
+            steps_til_x0 = inference_steps - (step + 1)
 
             if not is_first_step:
-                ratio = torch.full(
-                    (1,), (step + 1) / self.inference_steps, device=device
-                )
-                mask_ratio = mask_ratio_schedule(ratio, num_tokens, self.mask_schedule)
+                ratio = torch.full((1,), (step + 1) / inference_steps, device=device)
+                mask_ratio = mask_ratio_schedule(ratio, num_tokens, mask_schedule)
                 num_tokens_mask = int(mask_ratio * num_tokens)
                 _, indices = scores.topk(num_tokens_mask, dim=-1)
                 mask = torch.zeros(shape, device=device).scatter(1, indices, 1).bool()
@@ -531,22 +713,33 @@ class Dynamics(nn.Module):
             logits = self.maskgit.forward(
                 input_token_ids,
                 actions,
+                prompt_tokens=prompt_tokens,
                 video_patch_shape=patch_shape,
+                tokenizer=tokenizer
             )[:, -num_tokens:]
 
-            temperature = self.sample_temperature * (
-                steps_til_x0 / self.inference_steps
-            )
+            temperature = sample_temperature * (steps_til_x0 / inference_steps)
             pred_video_ids = gumbel_sample(logits, temperature=temperature)
 
-            video_token_ids = torch.where(mask, pred_video_ids, video_token_ids)
+            video_token_ids = (
+                pred_video_ids  # torch.where(mask, pred_video_ids, video_token_ids)
+            )
 
-            if not is_last_step:
+            if not is_last_step or return_confidence:
                 scores = self.compute_confidence_scores(
                     pred_video_ids,
                     logits,
                     mask,
                 )[:, -num_tokens:]
+
+                if return_confidence:
+                    all_scores.append(scores)
+
+        if return_logits:
+            return logits
+
+        if return_confidence:
+            return video_token_ids, all_scores
 
         return video_token_ids
 
@@ -557,6 +750,8 @@ class Dynamics(nn.Module):
         video_mask=None,
         accelerator_tracker_dict=None,
         return_token_ids=False,
+        return_logits=False,
+        tokenizer=None,
         *args,
         **kwargs,
     ):
@@ -574,9 +769,9 @@ class Dynamics(nn.Module):
             torch.Tensor or tuple: Loss value or (loss, token_ids) if return_token_ids is True.
         """
 
-        assert exists(video_codebook_ids) and exists(
-            actions
-        ), "video_codebook_ids and actions must be provided"
+        assert exists(video_codebook_ids) and exists(actions), (
+            "video_codebook_ids and actions must be provided"
+        )
 
         # Prepare input for the model
         maskgit_input_video_codebook_ids = video_codebook_ids[:, :-1]
@@ -611,15 +806,18 @@ class Dynamics(nn.Module):
             masked_input_video,
             actions,
             video_mask=video_mask,
+            tokenizer=tokenizer,
         )
 
         # Compute loss
-        loss = F.cross_entropy(
+        loss = self.loss_function(
             logits[token_mask],
             video_codebook_ids[token_mask],
+            accelerator_tracker_dict,
         )
 
-        self.accelator_log(accelerator_tracker_dict, loss)
+        if return_logits:
+            return loss, logits
 
         if return_token_ids:
             pred_video_ids = gumbel_sample(

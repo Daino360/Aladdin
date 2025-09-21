@@ -1,43 +1,29 @@
 from contextlib import contextmanager
 from pathlib import Path
-from einops import rearrange
-from beartype import beartype
 
 import torch
-from torch import nn
-from torch.utils.data import DataLoader, Subset
-
-
+import wandb
+from accelerate import Accelerator, DistributedType
+from accelerate.utils import DistributedDataParallelKwargs
+from beartype import beartype
 from einops import rearrange
+from PIL import Image
+from torch import nn
+from torch.utils.data import DataLoader, Dataset, Subset
 from tqdm import tqdm
-
-from models.genie_redux import GenieRedux, GenieReduxGuided
-from models.lam import LatentActionModel
-from models.tokenizer import Tokenizer
-from training.optimizer import get_optimizer, LinearWarmup_CosineAnnealing
 
 from data.data import (
     video_tensor_to_gif,
     video_tensor_to_pil_images,
-    EnvironmentDataset as Dataset,
 )
-
-
-from accelerate import Accelerator, DistributedType
-from accelerate.utils import DistributedDataParallelKwargs
-
-import wandb
-
+from models.genie_redux import GenieRedux, GenieReduxGuided
+from models.lam import LatentActionModel
+from models.tokenizer import Tokenizer
+from tools.logger import getLogger
 from training.evaluation import Evaluator
+from training.optimizer import LinearWarmup_CosineAnnealing, get_optimizer
 
-import torch
-
-from PIL import Image
-
-from utils.utils import debug
-
-
-# helpers
+log = getLogger(__name__)
 
 
 def exists(val):
@@ -178,6 +164,7 @@ class Trainer(nn.Module):
         self.wandb_log_every = wandb_log_every
         self.num_frames = num_frames
         self.sample_num_frames = sample_num_frames
+        self.use_decoder_loss = getattr(train_config.train, "use_decoder_loss", False)
 
         # Create config dictionary for logging
         config = {}
@@ -190,7 +177,7 @@ class Trainer(nn.Module):
         config["model_config"] = model.config
 
         # Determine the type of model
-        self.is_genie = isinstance(model, GenieRedux | GenieReduxGuided)
+        self.is_genie = isinstance(model, (GenieRedux, GenieReduxGuided))
         self.is_lam = isinstance(model, LatentActionModel)
 
         if accelerator is not None:
@@ -461,6 +448,7 @@ class Trainer(nn.Module):
                     "tracker": self.accelerator,
                     "step": step,
                     "train": True,
+                    "log_every": self.wandb_log_every,
                 }
 
             # Compute loss with automatic mixed precision
@@ -473,6 +461,7 @@ class Trainer(nn.Module):
                         actions=actions,
                         apply_grad_penalty=apply_grad_penalty,
                         accelerator_tracker_dict=accelerator_tracker_dict,
+                        use_decoder_loss=self.use_decoder_loss,
                     )
 
                 # Backward pass
@@ -508,6 +497,7 @@ class Trainer(nn.Module):
                 "tracker": self.accelerator,
                 "step": step,
                 "train": False,
+                "log_every": self.wandb_log_every,
             }
             psnrs = []
             with torch.no_grad():
@@ -521,6 +511,7 @@ class Trainer(nn.Module):
                         actions=actions,
                         step=step,
                         accelerator_tracker_dict=accelerator_tracker_dict,
+                        use_decoder_loss=self.use_decoder_loss,
                     )
 
                     if self.is_genie:

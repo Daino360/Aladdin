@@ -1,19 +1,15 @@
 # adapted from https://github.com/lucidrains/vector-quantize-pytorch
 
 from functools import partial
-
-import torch
-from torch import nn, einsum
-import torch.nn.functional as F
-import torch.distributed as distributed
-from torch.optim import Optimizer
-from torch.cuda.amp import autocast
-
-from einops import rearrange, repeat, reduce, pack, unpack
-
 from typing import Callable
 
-from utils.utils import debug
+import torch
+import torch.distributed as distributed
+import torch.nn.functional as F
+from einops import pack, rearrange, reduce, repeat, unpack
+from torch import einsum, nn
+from torch.amp import autocast
+from torch.optim import Optimizer
 
 
 def exists(val):
@@ -98,9 +94,9 @@ def gumbel_sample(
     ind = sampling_logits.argmax(dim=dim)
     one_hot = F.one_hot(ind, size).type(dtype)
 
-    assert not (
-        reinmax and not straight_through
-    ), "reinmax can only be turned on if using straight through gumbel softmax"
+    assert not (reinmax and not straight_through), (
+        "reinmax can only be turned on if using straight through gumbel softmax"
+    )
 
     if not straight_through or temperature <= 0.0 or not training:
         return ind, one_hot
@@ -323,9 +319,9 @@ class EuclideanCodebook(nn.Module):
         self.gumbel_sample = gumbel_sample
         self.sample_codebook_temp = sample_codebook_temp
 
-        assert not (
-            use_ddp and num_codebooks > 1 and kmeans_init
-        ), "kmeans init is not compatible with multiple codebooks in distributed environment for now"
+        assert not (use_ddp and num_codebooks > 1 and kmeans_init), (
+            "kmeans init is not compatible with multiple codebooks in distributed environment for now"
+        )
 
         self.sample_fn = (
             sample_vectors_distributed
@@ -506,7 +502,7 @@ class EuclideanCodebook(nn.Module):
         batch_samples = rearrange(batch_samples, "h ... d -> h (...) d")
         self.replace(batch_samples, batch_mask=expired_codes)
 
-    @autocast(enabled=False)
+    @autocast("cuda", enabled=False)
     def forward(self, x, sample_codebook_temp=None, mask=None, freeze_codebook=False):
         needs_codebook_dim = x.ndim < 4
         sample_codebook_temp = default(sample_codebook_temp, self.sample_codebook_temp)
@@ -556,7 +552,6 @@ class EuclideanCodebook(nn.Module):
             quantize = batched_embedding(embed_ind, embed)
 
         if self.training and self.ema_update and not freeze_codebook:
-
             if self.affine_param:
                 flatten = (flatten - self.batch_mean) * (
                     codebook_std / batch_std
@@ -711,7 +706,7 @@ class CosineSimCodebook(nn.Module):
         batch_samples = rearrange(batch_samples, "h ... d -> h (...) d")
         self.replace(batch_samples, batch_mask=expired_codes)
 
-    @autocast(enabled=False)
+    @autocast("cuda", enabled=False)
     def forward(self, x, sample_codebook_temp=None, mask=None, freeze_codebook=False):
         needs_codebook_dim = x.ndim < 4
         sample_codebook_temp = default(sample_codebook_temp, self.sample_codebook_temp)
@@ -860,14 +855,14 @@ class VectorQuantize(nn.Module):
         self.orthogonal_reg_active_codes_only = orthogonal_reg_active_codes_only
         self.orthogonal_reg_max_codes = orthogonal_reg_max_codes
 
-        assert not (
-            ema_update and learnable_codebook
-        ), "learnable codebook not compatible with EMA update"
+        assert not (ema_update and learnable_codebook), (
+            "learnable codebook not compatible with EMA update"
+        )
 
         assert 0 <= sync_update_v <= 1.0
-        assert not (
-            sync_update_v > 0.0 and not learnable_codebook
-        ), "learnable codebook must be turned on"
+        assert not (sync_update_v > 0.0 and not learnable_codebook), (
+            "learnable codebook must be turned on"
+        )
 
         self.sync_update_v = sync_update_v
 
@@ -903,9 +898,9 @@ class VectorQuantize(nn.Module):
         )
 
         if affine_param:
-            assert (
-                not use_cosine_sim
-            ), "affine param is only compatible with euclidean codebook"
+            assert not use_cosine_sim, (
+                "affine param is only compatible with euclidean codebook"
+            )
             codebook_kwargs = dict(
                 **codebook_kwargs,
                 affine_param=True,
@@ -1035,7 +1030,6 @@ class VectorQuantize(nn.Module):
         # one step in-place update
 
         if should_inplace_optimize and self.training and not freeze_codebook:
-
             if exists(mask):
                 loss = F.mse_loss(quantize, x.detach(), reduction="none")
 
@@ -1140,7 +1134,6 @@ class VectorQuantize(nn.Module):
         # debug(f"Loss: {loss.item()}")
 
         if self.training:
-
             loss = loss + q_loss
             # debug(f"loss: {loss.item()}")
 
@@ -1182,9 +1175,9 @@ class VectorQuantize(nn.Module):
                 # only calculate orthogonal loss for the activated codes for this batch
 
                 if self.orthogonal_reg_active_codes_only:
-                    assert not (
-                        is_multiheaded and self.separate_codebook_per_head
-                    ), "orthogonal regularization for only active codes not compatible with multi-headed with separate codebooks yet"
+                    assert not (is_multiheaded and self.separate_codebook_per_head), (
+                        "orthogonal regularization for only active codes not compatible with multi-headed with separate codebooks yet"
+                    )
                     unique_code_ids = torch.unique(embed_ind)
                     codebook = codebook[:, unique_code_ids]
 

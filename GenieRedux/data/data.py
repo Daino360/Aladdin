@@ -1,38 +1,30 @@
-import fcntl
+import json
+import logging
+import math
+import random
+from multiprocessing import Lock, cpu_count
+from multiprocessing.pool import ThreadPool
 from pathlib import Path
+from typing import Dict, List, Tuple
 
 import cv2
-from PIL import Image
-
-from typing import Dict, Tuple, List
-
 import numpy as np
-
+import pandas as pd
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset
-from torchvision import transforms as T, transforms
+from packaging.version import Version
+from PIL import Image
+from torch.utils.data import Dataset, Subset
+from torchvision import transforms
+from torchvision import transforms as T
+from tqdm import tqdm
 
 from data_generation.data.data import (
     DEFAULT_VERSION,
     DatasetFileStructure,
     DatasetFileStructureInstance,
 )
-
-import math
-from multiprocessing import cpu_count
-from multiprocessing.pool import ThreadPool
-import json
-import dill
-import random
-from packaging.version import Version
-import pandas as pd
-
-from multiprocessing import Lock
-from multiprocessing.pool import ThreadPool
 from tools.logger import getLogger
-from tqdm import tqdm
-import time
 
 log = getLogger("data", name_color="blue")
 
@@ -138,7 +130,6 @@ def video_tensor_to_pil_images(tensor, only_first_image=True):
 def video_tensor_to_gif(
     tensor, path, duration=120, loop=0, optimize=True, actions=None
 ):
-
     tensor = torch.clamp(tensor, min=0, max=1)  # clipping underflow and overflow
     images = map(T.ToPILImage(), tensor.unbind(dim=1))
 
@@ -164,9 +155,7 @@ def gif_to_tensor(path, channels=3, transform=T.ToTensor()):
 
 
 def tqdm_function_decorator(total, *args, **kwargs):
-
     class PbarFunctionDecorator(object):
-
         def __init__(self, func):
             self.func = func
             self.pbar = tqdm(total=total, *args, **kwargs)
@@ -189,7 +178,8 @@ class DatasetFileStructureSessionLibrary:
         self.version = self.fs.version
         self.instance_ids = self.fs.get_instance_ids()
         self.sessions = {
-            i: DatasetFileStructureInstance(root, i, self.fs.version, **kwargs) for i in self.instance_ids  # type: ignore
+            i: DatasetFileStructureInstance(root, i, self.fs.version, **kwargs)
+            for i in self.instance_ids  # type: ignore
         }
 
     def __getitem__(self, key: int) -> DatasetFileStructureInstance:
@@ -213,12 +203,190 @@ class DatasetOutputFormat:
     GENERAL = "general"
 
 
-class Dataset:
+class CombinedEnvironmentDataset(Dataset):
+    def __init__(self, datasets: List[Dataset]) -> None:
+        super().__init__()
+        self.datasets = datasets
+
+    def __len__(self):
+        return len(self.datasets) * max([len(dataset) for dataset in self.datasets])
+
     def __getitem__(self, idx):
-        raise NotImplementedError
+        dataset_id = idx % len(self.datasets)
+        dataset = self.datasets[dataset_id]
+        sample_id = math.floor(idx / len(self.datasets)) % len(dataset)
+
+        return dataset[sample_id]
+
+
+class MultiEnvironmentDataset(Dataset):
+    def __init__(
+        self,
+        root_dpath,
+        seq_length_input: int = 5,
+        seq_step: int = 1,
+        enable_test: bool = False,
+        split: str = "train",
+        split_type: str = "frame",
+        clip_length: int = 0,
+        max_size: int | None = None,
+        format: str = DatasetOutputFormat.GENERAL,
+        transform=None,
+        img_ext="jpg",
+        instance_filter: dict | None = None,
+        enable_cache: bool = True,
+        cache_dpath: str = "cache",
+        occlusion_mask: np.ndarray | None = None,
+        n_workers: int = 46,
+        n_envs: int = 0,
+        whitelist: list[str] = None,
+        n_samples: int = -1,
+        n_actions: int = -1,
+    ) -> None:
+        """
+        Initializes the Data class.
+
+        Args:
+            root_dpath (str): The root directory path.
+            seq_length_input (int, optional): The input sequence length. Defaults to 5.
+            seq_step (int, optional): The sequence step. Defaults to 1.
+            enable_test (bool, optional): Flag to enable test mode. Defaults to False.
+            split (str, optional): The dataset split. Defaults to "train".
+            split_type (str, optional): The split type. One of "instance" or "frame". Defaults to "frame".
+            clip_length (int, optional): The clip length. If set to 0, the clip length is set to 1e12. Defaults to 0.
+            max_size (int, optional): The maximum size of the dataset. Defaults to None.
+            format (str, optional): The dataset format. Defaults to DatasetOutputFormat.GENERAL.
+            transform (optional): The data transformation function. Defaults to None.
+            img_ext (str, optional): The image file extension. Defaults to "jpg".
+            instance_filter (dict, optional): A dict of acceptable session properties to use. Defaults to None.
+            enable_cache (bool, optional): Flag to enable caching. Defaults to True.
+            cache_dpath (str, optional): The cache directory path. Defaults to "cache".
+            occlusion_mask (np.ndarray, optional): The occlusion mask to use. Defaults to None.
+            n_workers (int, optional): The number of workers to use. Defaults to 46.
+            n_envs (int, optional): The number of environments to use. Negative value denotes using the last n environments. The value 0 denotes all environments. Defaults to 0.
+            whitelist (list[str], optional): A list of environment names to use. Defaults to None.
+            n_samples (int, optional): The number of samples per environment to use. Negative value denotes using all samples. Defaults to -1.
+        """
+        use_last_n = n_envs < 0
+        n_envs = abs(n_envs)
+        assert n_envs == 0 or whitelist is None or len(whitelist) <= n_envs, (
+            "Whitelist length should be less than n_envs"
+        )
+
+        self.log = getLogger("MultiEnvironmentDataset", name_color="blue")
+
+        paths = sorted(
+            [path for path in Path(root_dpath).iterdir() if path.is_dir()],
+            key=lambda x: x.name,
+        )  # [:5]
+
+        paths_selected = []
+        if whitelist is not None:
+            paths_whitelist = [
+                path for path in paths if path.name.split("_")[1] in whitelist
+            ]
+            paths_selected.extend(paths_whitelist)
+
+        if whitelist is None:
+            paths_no_whitelist = paths
+            whitelist_len = 0
+        else:
+            paths_no_whitelist = [
+                path for path in paths if path.name.split("_")[1] not in whitelist
+            ]
+            whitelist_len = len(whitelist)
+
+        if n_envs > 0:
+            if use_last_n:
+                paths_selected.extend(paths_no_whitelist[-n_envs + whitelist_len :])
+            else:
+                paths_selected.extend(paths_no_whitelist[: n_envs - whitelist_len])
+        else:
+            paths_selected.extend(paths_no_whitelist)
+
+        if n_envs > 0 or whitelist is not None:
+            paths = paths_selected
+
+        # paths = paths[-200:]
+
+        def create_environment_dataset(path, id):
+            self.log.d(f"Creating dataset {id} from {path}")
+            try:
+                dataset = EnvironmentDataset(
+                    root_dpath=path,
+                    seq_length_input=seq_length_input,
+                    seq_step=seq_step,
+                    enable_test=enable_test,
+                    split=split,
+                    split_type=split_type,
+                    clip_length=clip_length,
+                    max_size=max_size,
+                    format=format,
+                    transform=transform,
+                    img_ext=img_ext,
+                    instance_filter=instance_filter,
+                    enable_cache=enable_cache,
+                    cache_dpath=cache_dpath,
+                    occlusion_mask=occlusion_mask,
+                )
+            except KeyError as e:
+                self.log.e(f"KeyError loading dataset from {path}: {e}")
+                dataset = None
+            except ValueError as e:
+                self.log.e(f"ValueError loading dataset from {path}: {e}")
+                dataset = None
+            if n_actions > 0:
+                dataset.n_actions = n_actions
+
+            return dataset
+
+        with ThreadPool(n_workers) as pool:
+            self.datasets = pool.starmap(
+                create_environment_dataset, [(path, i) for i, path in enumerate(paths)]
+            )
+        self.datasets = [dataset for dataset in self.datasets if dataset is not None]
+
+        if len(self.datasets) == 0:
+            raise ValueError("Empty dataset!")
+
+        if n_samples > 0:
+            self.datasets = [
+                Subset(dataset, range(0, min(len(dataset), n_samples)))
+                for dataset in self.datasets
+            ]
+
+        self.log.i(f"Loaded {len(self.datasets)} datasets")
+        self.size = sum([len(dataset) for dataset in self.datasets])
+
+        self.cummulative_size = np.cumsum([len(dataset) for dataset in self.datasets])
+        self.n_datasets = len(self.datasets)
+        # self.current_dataset_id = 0
+
+    def __len__(self):
+        return self.size
+
+    def __getitem__(self, idx):
+        # find out in which range in cummulative size the idx falls in
+        dataset_id = np.argmax(self.cummulative_size > idx)
+        new_idx = idx - self.cummulative_size[dataset_id - 1] if dataset_id > 0 else idx
+        # breakpoint()
+        try:
+            item = self.datasets[dataset_id][new_idx]
+        except IndexError as e:
+            self.log.e(
+                "IndexError: ",
+                new_idx,
+                idx,
+                len(self.datasets[dataset_id]),
+                self.cummulative_size,
+                len(self),
+            )
+            raise e
+        # self.current_dataset_id = (self.current_dataset_id + 1) % self.n_datasets
+        return item
+
 
 class EnvironmentDataset(Dataset):
-
     __DATASET_SPLIT = {
         "train": [0, 0.9],
         "validation": [0.9, 0.99],
@@ -272,9 +440,13 @@ class EnvironmentDataset(Dataset):
         self.split_type = split_type
         self.clip_length = clip_length
 
-        log.i(f"Creating dataset from {root_dpath}")
+        # self.jitter_transform = torchvision.transforms.ColorJitter(brightness= 0.05, contrast= 0, saturation = 0.2, hue = 0.5)
+
+        self.log = getLogger("data:EnvironmentDataset", name_color="blue")
+
+        self.log.i(f"Creating dataset from {root_dpath}")
         if self.occlusion_mask is not None:
-            log.d("Using occlusion mask!")
+            self.log.d("Using occlusion mask!")
 
         self.info = EnvironmentDataset.__read_info(
             DatasetFileStructure(root_dpath).info_fpath
@@ -322,7 +494,6 @@ class EnvironmentDataset(Dataset):
 
     @staticmethod
     def __read_info(info_fpath):
-
         if info_fpath.exists():
             with open(info_fpath, "r") as json_file:
                 info = json.load(json_file)
@@ -348,10 +519,7 @@ class EnvironmentDataset(Dataset):
         if self.n_actions is None:
             actions = list(self.metadata.values())[0]["action"].to_numpy()
             # if isinstance(actions[0], list):
-            if isinstance(actions[0], list):
-                self.n_actions = len(actions[0])
-            else:
-                self.n_actions = self.info["info"]["action_space"][-1]
+            self.n_actions = len(actions[0])
             # else:
             #     unique_top_left_values = np.unique(actions)
             #     unique_top_left_values.sort()
@@ -367,7 +535,6 @@ class EnvironmentDataset(Dataset):
             return np.eye(n)[np.zeros_like(x).flatten().astype(int)]
 
     def __build_split(self, metadata, split, split_type="instance"):
-
         n_elements = len(metadata)
 
         if split_type == "instance":
@@ -378,10 +545,10 @@ class EnvironmentDataset(Dataset):
 
             metadata = {id: metadata[id] for id in dataset_split}
         elif split_type == "session":
-
             for i in range(n_elements):
                 # get all unique values of session_id in the dataframe metadata[i]
                 session_ids = sorted(list(metadata[i]["session_id"].unique()))
+
                 session_ids = session_ids[
                     int(
                         math.floor(len(session_ids) * self.__DATASET_SPLIT[split][0])
@@ -389,7 +556,6 @@ class EnvironmentDataset(Dataset):
                         math.floor(len(session_ids) * self.__DATASET_SPLIT[split][1])
                     )
                 ]
-
                 # select only those elements of metadata[i] which elements are in session_ids
                 metadata[i] = metadata[i][metadata[i]["session_id"].isin(session_ids)]
         elif split_type == "frame":
@@ -420,7 +586,7 @@ class EnvironmentDataset(Dataset):
     def __create_metadata(self):
         has_read_error = False
         if self.enable_cache and self.cache_metadata_fpath.exists():
-            log.d("Loading metadata from cache... : ", self.cache_metadata_fpath)
+            self.log.d("Loading metadata from cache... : ", self.cache_metadata_fpath)
             with open(self.cache_metadata_fpath, "rb") as f:
                 try:
                     metadata = {}
@@ -430,18 +596,18 @@ class EnvironmentDataset(Dataset):
                             metadata_from_file["instance_id"] == instance_id
                         ]
 
-                except EOFError as e:
-                    log.e(
+                except EOFError:
+                    self.log.e(
                         f"EOFError loading metadata from cache: {self.cache_metadata_fpath}"
                     )
                     has_read_error = True
-                except OSError as e:
-                    log.e(
+                except OSError:
+                    self.log.e(
                         f"OSError loading metadata from cache: {self.cache_metadata_fpath}"
                     )
                     has_read_error = True
-                except Exception as e:
-                    log.e(
+                except Exception:
+                    self.log.e(
                         f"Error loading metadata from cache: {self.cache_metadata_fpath}"
                     )
                     has_read_error = True
@@ -519,12 +685,12 @@ class EnvironmentDataset(Dataset):
                             ignore_index=True,
                         )
                         pd.DataFrame(metadata_to_store).to_feather(f)
-                    except EOFError as e:
-                        log.e(
+                    except EOFError:
+                        self.log.e(
                             f"EOFError writing metadata to cache: {self.cache_metadata_fpath}"
                         )
-                    except OSError as e:
-                        log.e(
+                    except OSError:
+                        self.log.e(
                             f"OSError writing metadata to cache: {self.cache_metadata_fpath}"
                         )
                     finally:
@@ -661,7 +827,6 @@ class EnvironmentDataset(Dataset):
         return frames
 
     def __getitem__(self, idx):
-
         # update data if seq_length_variable has changed, use locking
         if self.seq_length_variable != self.seq_length_current:
             with self.lock:
@@ -700,6 +865,9 @@ class EnvironmentDataset(Dataset):
                 self.transform if self.format != DatasetOutputFormat.PVG else None
             ),
         )
+
+        # frames = self.jitter_transform(torch.tensor(frames, dtype=torch.float32)).numpy()
+
         input_frames = frames[:-1]
         output_frame = frames[-1]
 
@@ -708,20 +876,34 @@ class EnvironmentDataset(Dataset):
             is_first = np.zeros((self.seq_length_variable + 1, 1), dtype=int)
             is_first[0, :] = np.ones_like(is_first[0, :])
             if np.array(self.info["info"]["action_space"])[-1] > 1:
-                if isinstance(
-                    list(self.metadata.values())[0]["action"].to_numpy()[0], list
+                if (
+                    self.n_actions is not None
+                    and np.array(self.info["info"]["action_space"])[-1]
+                    != self.n_actions
                 ):
                     actions_one_hot = actions
                 else:
-                    actions = actions.reshape(-1, 1)
-                    actions_one_hot = np.array(
-                        [
-                            self._one_hot(action, self.__get_n_actions())[0]
-                            for action in actions
-                        ]
-                    )
+                    actions_one_hot = actions
             else:
                 actions_one_hot = self._one_hot(actions, self.__get_n_actions())
+
+            if np.array(self.info["info"]["action_space"])[-1] == 7:
+                actions_one_hot = self._one_hot(
+                    actions, np.array(self.info["info"]["action_space"])[-1]
+                )
+
+                actions_one_hot = actions_one_hot[:, [1, 2, 0, 6, 3, 4, 5]]
+                new_actions = []
+                for action in actions_one_hot:
+                    if action[-2] == 1:
+                        action[0] = 1
+                        action[4] = 1
+                    elif action[-1] == 1:
+                        action[1] = 1
+                        action[4] = 1
+                    new_actions.append(action)
+                actions_one_hot = np.array(new_actions)
+                actions_one_hot = actions_one_hot[:, :-2]
 
             output = {
                 "input_frames": np.concatenate(
@@ -794,6 +976,73 @@ class EnvironmentDataset(Dataset):
 
 
 class TransformsGenerator:
+    @staticmethod
+    def color_jitter_transform(
+        image: np.ndarray, brightness: int, contrast: int, saturation: int, hue: int
+    ):
+        """
+        Apply color jitter to the image
+        :param image: The image to apply color jitter to
+        :param brightness: The brightness factor
+        :param contrast: The contrast factor
+        :param saturation: The saturation factor
+        :param hue: The hue factor
+        :return: The image with color jitter applied
+        """
+        image = image.transpose(0, 2, 3, 1)
+        image = image.astype(np.float32) / 255.0  # Normalize to [0, 1]
+
+        # Apply brightness jitter
+        if brightness > 0:
+            factor = random.uniform(max(0, 1 - brightness), 1 + brightness)
+            image = np.clip(image * factor, 0, 1)
+
+        # Apply contrast jitter
+        if contrast > 0:
+            factor = random.uniform(max(0, 1 - contrast), 1 + contrast)
+            mean = np.mean(image, axis=(0, 1), keepdims=True)
+            image = np.clip((image - mean) * factor + mean, 0, 1)
+
+        # Apply saturation jitter
+        if saturation > 0:
+            factor = random.uniform(max(0, 1 - saturation), 1 + saturation)
+            gray = np.dot(image, [0.2989, 0.5870, 0.1140])
+            gray = np.expand_dims(gray, axis=-1)
+            image = np.clip(image * factor + gray * (1 - factor), 0, 1)
+
+        # Apply hue jitter
+        if hue > 0:
+            shift_degrees = random.uniform(-hue, hue)
+            for i in range(image.shape[0]):  # Iterate over the batch dimension
+                # Convert to float first, but do not divide the hue by 255, just S and V:
+                hsv_image = cv2.cvtColor(image[i], cv2.COLOR_RGB2HSV).astype(np.float32)
+
+                # Extract the channels
+                H = hsv_image[..., 0]
+                S = hsv_image[..., 1] / 255.0
+                V = hsv_image[..., 2] / 255.0
+
+                # Convert the 8-bit Hue [0..179] to a [0..1] scale that represents 0..360 degrees
+                # i.e. 179 -> 1.0 corresponds to 360 degrees
+                # So H_float in [0..1] now means [0..360 deg].
+                H_float = H / 179.0
+
+                # Now apply your shift in "turns" or fraction of 1.0 for 360 degrees
+                # e.g. want ±30 degrees => shift_fraction = ±(30/360)=±0.0833
+
+                shift_fraction = shift_degrees / 360.0
+                H_float = (H_float + shift_fraction) % 1.0
+
+                # Convert back to OpenCV scale: if H_float=1.0 => 360 degrees => 179 in 8-bit
+                H = (H_float * 179).astype(np.float32)
+                S = (S * 255.0).astype(np.float32)
+                V = (V * 255.0).astype(np.float32)
+
+                hsv_image = np.stack([H, S, V], axis=-1).astype(np.uint8)
+                image[i] = cv2.cvtColor(hsv_image, cv2.COLOR_HSV2RGB)
+
+        image = image.transpose(0, 3, 1, 2)
+        return (image * 255).astype(np.uint8)
 
     @staticmethod
     def pad_to_match_aspect_ratio(image: np.ndarray, target_size: Tuple[int, int]):
@@ -921,7 +1170,7 @@ class TransformsGenerator:
 
     @staticmethod
     def get_final_transforms(
-        observation_space, crop_size
+        observation_space, crop_size, **kwargs
     ) -> Dict[str, transforms.Compose]:
         """
         Obtains the transformations to use for training and evaluation
@@ -936,20 +1185,124 @@ class TransformsGenerator:
         # resize_transform = TransformsGenerator.check_and_resize(config.data.crop,
         #                                                         config.observation_space[config.encoder.enc_cnn_keys[0]][1:])
 
+        components = []
         resize_transform = TransformsGenerator.check_and_resize(
             crop_size, observation_space
         )
-        transform = transforms.Compose(
-            [
-                resize_transform,
-                transforms.ToTensor(),
-                # TransformsGenerator.to_float_tensor,
-                # transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
-            ]
-        )
+        components.append(resize_transform)
+
+        if "color_jitter" in kwargs:
+            color_jitter_transform = transforms.Lambda(
+                lambda x: TransformsGenerator.color_jitter_transform(
+                    x,
+                    kwargs["color_jitter"]["brightness"],
+                    kwargs["color_jitter"]["contrast"],
+                    kwargs["color_jitter"]["saturation"],
+                    kwargs["color_jitter"]["hue"],
+                )
+            )
+            components.append(color_jitter_transform)
+
+        components.append(transforms.ToTensor())
+
+        transform = transforms.Compose(components)
 
         return {
             "train": transform,
             "validation": transform,
             "test": transform,
         }
+
+
+class EnvironmentDatasetTester:
+    def __init__(self, dataset: EnvironmentDataset, ouput_dpath):
+        self.dataset = dataset
+        self.output_dpath = ouput_dpath
+        self.output_dpath.mkdir(parents=True, exist_ok=True)
+        for f in self.output_dpath.iterdir():
+            f.unlink()
+
+    def visualize(self, idx):
+        data = self.dataset[idx]
+        input_frames = list(data["input_frames"])
+        for i in range(len(input_frames)):
+            input_frames[i] = cv2.resize(
+                input_frames[i],
+                (input_frames[i].shape[1] * 4, input_frames[i].shape[0] * 4),
+            )
+
+        input_frames = np.array(input_frames)
+
+        output_frame = data["output_frame"][0]
+        output_frame = cv2.resize(
+            output_frame, (output_frame.shape[1] * 4, output_frame.shape[0] * 4)
+        )
+        actions = data["actions"]
+        # output_frame = output_frame.transpose(0, 1, 2, 0)
+        # input_frames = input_frames.transpose(0, 2, 3, 1)
+
+        actions_captions = []
+        if "action_captions" in self.dataset.info["info"]:
+            captions = self.dataset.info["info"]["action_captions"]
+
+            for i in range(len(actions)):
+                actions_captions.append(captions[np.argmax(actions[i])])
+        else:
+            actions_captions = actions.tolist()
+
+        # #in output, on each image across the first dimension add text with the frame_id
+
+        for i in range(self.dataset.seq_length_current):
+            cv2.putText(
+                input_frames[i, :, :, :],
+                str(data["src_frame_ids"][i]) + f": {actions_captions[i]}",
+                (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1,
+                (255, 0, 0),
+                2,
+                cv2.LINE_AA,
+            )
+        cv2.putText(
+            output_frame,
+            str(data["tgt_frame_id"]),
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (255, 0, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+        # concatenate all images in input_frames
+        input_frames = np.concatenate(input_frames, axis=1)
+        output = np.concatenate([input_frames, output_frame], axis=1)
+
+        log.i("Writing to", str(self.output_dpath / f"{idx}_output.png"))
+        cv2.imwrite(str(self.output_dpath / f"{idx}_output.png"), output[:, :, ::-1])
+
+    def __getitem__(self, idx):
+        self.visualize(idx)
+        return self.dataset[idx]
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __iter__(self):
+        for idx in range(len(self)):
+            yield self[idx]
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    tester = EnvironmentDatasetTester(
+        EnvironmentDataset(
+            "../../datasets/retro_act_v1.1.1/retro_montezumarevenge-atari2600_v1.1.1__frameskip4/",
+            seq_length_input=15,
+            split="test",
+            split_type="instance",
+        ),
+        Path("output/retro_act_v1.0.1"),
+    )
+    for idx, i in enumerate(tester):
+        pass

@@ -2,11 +2,8 @@ import json
 import os
 import os.path as osp
 from pathlib import Path
-from tools.logger import getLogger
+
 from packaging.version import Version
-
-log = getLogger(name="data_gen")
-
 
 DEFAULT_VERSION = Version("0.0.0")
 
@@ -19,10 +16,13 @@ class DatasetFileStructure:
     LOSE_LABEL = "lose"
 
     def __init__(
-        self, root_dpath: str, version: Version = DEFAULT_VERSION, extension="jpg"
+        self,
+        root_dpath: str,
+        version: Version = DEFAULT_VERSION,
+        extension="jpg",
     ) -> None:
         self.root_dpath = Path(root_dpath)
-        self.root_dpath.mkdir(parents=True, exist_ok=True)
+        # self.root_dpath.mkdir(parents=True, exist_ok=True)
         self.instance_id_format = "{:06d}"  # "{:04d}"
         self.session_id_format = "{:06d}"  # "{:04d}"
         self.frame_id_format = "{:06d}"
@@ -31,7 +31,7 @@ class DatasetFileStructure:
         self.info_fpath = self.root_dpath / "info.json"
 
         if self.info_fpath.exists():
-            with open(self.info_fpath, "r") as json_file:
+            with open(self.info_fpath) as json_file:
                 info = json.load(json_file)
                 self.version = Version(str(info["version"]))
                 # if version < self.version:
@@ -64,7 +64,7 @@ class DatasetFileStructure:
         fpath = Path(
             str(self.actions_fpath)
             .replace(self.INSTANCE_ID, self.instance_id_format.format(instance_id))
-            .replace(self.SESSION_ID, self.session_id_format.format(session_id))
+            .replace(self.SESSION_ID, self.session_id_format.format(session_id)),
         )
 
         if make_dirs:
@@ -97,7 +97,9 @@ class DatasetFileStructure:
 class DatasetFileStructureInstance(DatasetFileStructure):
     @staticmethod
     def replace(
-        path: str | Path | None, old_str: str, new_str: str
+        path: str | Path | None,
+        old_str: str,
+        new_str: str,
     ) -> str | Path | None:
         """Replace a string in a Path."""
 
@@ -111,7 +113,11 @@ class DatasetFileStructureInstance(DatasetFileStructure):
         return new_path
 
     def __init__(
-        self, root_dpath, instance_id, version: float = DEFAULT_VERSION, **kwargs
+        self,
+        root_dpath,
+        instance_id,
+        version: Version = DEFAULT_VERSION,
+        **kwargs,
     ) -> None:
         super().__init__(root_dpath, version=version, **kwargs)
         self.instance_id = instance_id
@@ -129,7 +135,7 @@ class DatasetFileStructureInstance(DatasetFileStructure):
             for var_name in super_class_vars
             if isinstance(var_name, str)
             and var_name.endswith(
-                ("_dpath", "_fpath", "_dname", "_fname", "_fmtfpath", "_fmtdpath")
+                ("_dpath", "_fpath", "_dname", "_fname", "_fmtfpath", "_fmtdpath"),
             )
         ]
 
@@ -139,7 +145,9 @@ class DatasetFileStructureInstance(DatasetFileStructure):
                 self,
                 var_name,
                 self.replace(
-                    getattr(self, var_name), self.INSTANCE_ID, self.instance_id_label
+                    getattr(self, var_name),
+                    self.INSTANCE_ID,
+                    self.instance_id_label,
                 ),
             )
 
@@ -165,7 +173,7 @@ class DatasetFileStructureInstance(DatasetFileStructure):
             getattr(self, var_name)
             for var_name in class_vars
             if isinstance(var_name, str)
-            and var_name.endswith(("_dpath"))
+            and var_name.endswith("_dpath")
             and not callable(getattr(self, var_name))
         ]
         for dpath in dpaths:
@@ -192,7 +200,11 @@ class DatasetFileStructureInstance(DatasetFileStructure):
         #         dpath = self.session_lose_dpath
         # else:
         session_id_label = self.session_id_format.format(session_id)
-        dpath: Path = self.replace(self.frame_fmtdpath, self.SESSION_ID, session_id_label)  # type: ignore
+        dpath: Path = self.replace(
+            self.frame_fmtdpath,
+            self.SESSION_ID,
+            session_id_label,
+        )  # type: ignore
         dpath.mkdir(parents=True, exist_ok=True)
 
         if frame_id is not None:

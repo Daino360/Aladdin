@@ -41,6 +41,7 @@ def cast_tuple(val, l=1):
 class STViViT(nn.Module):
     def __init__(
         self,
+        *,
         dim=512,
         codebook_size=1024,
         image_size=64,
@@ -57,6 +58,7 @@ class STViViT(nn.Module):
         ff_mult=4.0,
         vq_loss_w=1.0,
         recon_loss_w=1.0,
+        enable_decoder=True,
     ):
         super(STViViT, self).__init__()
 
@@ -64,6 +66,7 @@ class STViViT(nn.Module):
 
         self.vq_loss_w = vq_loss_w
         self.recon_loss_w = recon_loss_w
+        self.enable_decoder = enable_decoder
 
         self.image_size = pair(image_size)
         self.patch_size = pair(patch_size)
@@ -117,7 +120,8 @@ class STViViT(nn.Module):
 
         # Encoder and decoder transformers
         self.encoder = STTransformer(order="st", **transformer_kwargs)
-        self.decoder = STTransformer(order="ts", **transformer_kwargs)
+        if self.enable_decoder:
+            self.decoder = STTransformer(order="ts", **transformer_kwargs)
 
         # Vector Quantization layer
         self.vq = VectorQuantize(
@@ -232,6 +236,7 @@ class STViViT(nn.Module):
         Returns:
             torch.Tensor: Reconstructed video.
         """
+        assert self.enable_decoder, "Decoder is disabled."
         tokens.shape[0]
         h, w = self.patch_height_width
 

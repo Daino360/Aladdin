@@ -1,11 +1,9 @@
 import torch
 import torch.nn.functional as F
+from einops import pack, rearrange, repeat, unpack
 from torch import nn
 
-from einops import rearrange, repeat, pack, unpack
-
 from models.components import STViViT
-
 
 # helpers
 
@@ -95,6 +93,7 @@ class Tokenizer(STViViT):
 
     def __init__(
         self,
+        *,
         dim=512,
         codebook_size=1024,
         image_size=64,
@@ -111,6 +110,8 @@ class Tokenizer(STViViT):
         ff_mult=4.0,
         vq_loss_w=1.0,
         recon_loss_w=1.0,
+        enable_decoder=True,
+        train_decoder_only=False,
     ):
         """
         Initializes the Tokenizer.
@@ -150,7 +151,10 @@ class Tokenizer(STViViT):
             ff_mult=ff_mult,
             vq_loss_w=vq_loss_w,
             recon_loss_w=recon_loss_w,
+            enable_decoder=enable_decoder,
         )
+
+        self.train_decoder_only = train_decoder_only
 
     def calculate_video_token_mask(self, videos, video_frame_mask):
         """
@@ -169,7 +173,9 @@ class Tokenizer(STViViT):
         # Ensure the number of frames (minus the first frame) is divisible by temporal patch size
         assert torch.all(
             ((video_frame_mask.sum(dim=-1) - 1) % self.temporal_patch_size) == 0
-        ), "number of frames must be divisible by temporal patch size, subtracting off the first frame"
+        ), (
+            "number of frames must be divisible by temporal patch size, subtracting off the first frame"
+        )
 
         # Split mask into first frame and rest of the frames
         first_frame_mask, rest_frame_mask = (
@@ -235,9 +241,9 @@ class Tokenizer(STViViT):
         """
         tokens_per_frame = self.image_num_tokens
 
-        assert (
-            num_tokens % tokens_per_frame
-        ) == 0, f"number of tokens must be divisible by number of tokens per frame {tokens_per_frame}"
+        assert (num_tokens % tokens_per_frame) == 0, (
+            f"number of tokens must be divisible by number of tokens per frame {tokens_per_frame}"
+        )
         assert num_tokens > 0
 
         pseudo_frames = num_tokens // tokens_per_frame
@@ -306,9 +312,9 @@ class Tokenizer(STViViT):
         # Validate input dimensions
         assert tuple(image_dims) == self.image_size
         assert not exists(mask) or mask.shape[-1] == f
-        assert divisible_by(
-            f - 1, self.temporal_patch_size
-        ), f"number of frames ({f}) minus one ({f - 1}) must be divisible by temporal patch size ({self.temporal_patch_size})"
+        assert divisible_by(f - 1, self.temporal_patch_size), (
+            f"number of frames ({f}) minus one ({f - 1}) must be divisible by temporal patch size ({self.temporal_patch_size})"
+        )
 
         # Split video into first frame and rest frames
         first_frame, rest_frames = videos[:, :, :1], videos[:, :, 1:]
@@ -334,6 +340,9 @@ class Tokenizer(STViViT):
             vq_mask = self.calculate_video_token_mask(videos, mask)
         tokens, indices, vq_loss = self.vq(tokens, mask=vq_mask)
 
+        if self.train_decoder_only:
+            tokens = tokens.detach()
+
         if return_only_codebook_ids:
             (indices,) = unpack(indices, packed_fhw_shape, "b *")
             return indices
@@ -343,9 +352,8 @@ class Tokenizer(STViViT):
         # Decode tokens
         recon_video = self.decode(tokens)
 
-        returned_recon = recon_video.clone()
-
         if return_recons_only:
+            returned_recon = recon_video
             return returned_recon
 
         # Compute losses
@@ -358,7 +366,10 @@ class Tokenizer(STViViT):
             recon_loss = F.mse_loss(videos, recon_video)
 
         # Combine losses
-        loss = self.vq_loss_w * vq_loss + self.recon_loss_w * recon_loss
+        if self.train_decoder_only:
+            loss = self.recon_loss_w * recon_loss
+        else:
+            loss = self.vq_loss_w * vq_loss + self.recon_loss_w * recon_loss
 
         # Log losses if needed
         if self.wandb_mode != "disabled" and step % log_every == 0:
@@ -371,6 +382,7 @@ class Tokenizer(STViViT):
             )
 
         if return_recons:
+            returned_recon = recon_video
             return loss, returned_recon
 
         return loss

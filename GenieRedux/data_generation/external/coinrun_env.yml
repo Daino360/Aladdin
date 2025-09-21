@@ -1,4 +1,4 @@
-name: coinrun2
+name: coinrun
 channels:
   - conda-forge
   - anaconda

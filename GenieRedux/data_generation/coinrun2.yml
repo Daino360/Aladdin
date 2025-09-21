@@ -197,4 +197,3 @@ dependencies:
       - wrapt==1.12.1
       - zipp==3.6.0
       - zmq==0.0.0
-prefix: /scratch/nedko_savov/tools/miniconda3/envs/coinrun2
