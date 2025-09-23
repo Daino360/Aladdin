@@ -1,3 +1,26 @@
+"""
+run.py: unified command-line entrypoint for two stacks:
+- AutoExplore (training/evaluation driven directly via Hydra-composed configs)
+- GenieRedux (training/evaluation delegated to Hydra-enabled scripts, with optional
+  multi-process launch through Accelerate)
+
+It also exposes a special subcommand:
+  `python run.py generate <hydra overrides>`
+which forwards to data_generation/generate.py after validating that any path-like
+overrides (_fpath/_dpath/_path) are absolute.
+
+Key behaviors
+-------------
+- Parses the first positional args: <stack> (auto_explore|genie_redux) and
+  <action> (train|eval).
+- For AutoExplore: composes Hydra config in-process and calls run(cfg)
+  from train_auto_explore or eval_auto_explore (lazy-imported to avoid side effects).
+- For GenieRedux: reads num_processes from Hydra config and either:
+  * launches the target script via accelerate.launch (multiprocess),
+  * or runs the script directly (single process).
+- Ensures unbuffered Python output for subprocesses so logs/progress are immediate.
+"""
+
 import argparse
 import sys
 import subprocess
@@ -12,6 +35,36 @@ from omegaconf import DictConfig
 
 
 def main() -> int:
+    """
+    Parse CLI, route to the requested stack/action, and execute.
+
+    Supported modes
+    ---------------
+    1) Data generation:
+       `python run.py generate <hydra overrides>`
+       - Validates that any *_fpath|*_dpath|*_path override is absolute
+         (to avoid ambiguous CWD issues).
+       - Delegates to data_generation/generate.py with the given overrides,
+         setting CWD to the data_generation directory.
+
+    2) AutoExplore:
+       `python run.py auto_explore (train|eval) <hydra overrides>`
+       - Composes the corresponding Hydra config (trainer/evaluate).
+       - Lazily imports train_auto_explore or eval_auto_explore.
+       - Calls their run(cfg) directly (no subprocess).
+
+    3) GenieRedux:
+       `python run.py genie_redux (train|eval) <hydra overrides>`
+       - Composes the default config (configs/default.yaml) with overrides.
+       - Reads train/eval.num_processes to decide:
+         * If >1, launches the chosen script via accelerate.launch (bf16).
+         * Otherwise, runs the script directly so its @hydra.main handles overrides.
+
+    Returns
+    -------
+    int
+        Process return code (0 on success, non-zero on failure).
+    """    
     # Special-case: expose data generation via `run.py generate <hydra overrides>`
     if len(sys.argv) > 1 and sys.argv[1] == "generate":
         overrides = sys.argv[2:]
