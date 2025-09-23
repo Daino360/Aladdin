@@ -59,9 +59,9 @@ dependencies:
       - numpy==2.2.6
       - nvidia-cublas-cu12==12.6.4.1
       - nvidia-cuda-cupti-cu12==12.6.80
-      - nvidia-cuda-nvrtc-cu12==12.6.77
-      - nvidia-cuda-runtime-cu12==12.6.77
-      - nvidia-cudnn-cu12==9.10.2.21
+      - nvidia-cuda-nvrtc-cu12==12.6.77 #
+      - nvidia-cuda-runtime-cu12==12.6.77 #
+      - nvidia-cudnn-cu12==9.10.2.21 #
       - nvidia-cufft-cu12==11.3.0.4
       - nvidia-cufile-cu12==1.11.1.6
       - nvidia-curand-cu12==10.3.7.77
@@ -94,6 +94,8 @@ dependencies:
       - sympy==1.13.3
       - torch==2.8.0+cu126
       - torchvision==0.23.0+cu126
+      # - torch==2.8.0+cu129 #ADDEDBYME
+      # - torchvision==0.23.0+cu129 ##ADDEDBYME
       - tqdm==4.67.1
       - traitlets==5.14.3
       - triton==3.4.0

@@ -54,6 +54,15 @@
             "args": ["--run-id myrun","--save-interval 1"],
             "console": "integratedTerminal",
             "justMyCode": true // to skip library code
+        },
+                {
+            "name": "Python GenieReduxUpdated Debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/home/sdainelli/Aladdin/GenieRedux/run.py",
+            "args": ["genie_redux","train","config=genie_redux_guided_pretrain.yaml","train.num_processes=4","train.batch_size=4","train.grad_accum=3","tokenizer_fpath=checkpoints/tokenizer/tokenizer/model-150000.pt"],
+            "console": "integratedTerminal",
+            "justMyCode": true // to skip library code
         }
     ]
 }

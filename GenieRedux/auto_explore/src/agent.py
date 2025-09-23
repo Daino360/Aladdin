@@ -1,3 +1,21 @@
+"""
+AutoExploreAgent: thin inference wrapper around an ActorCritic policy (world model kept but unused here).
+
+- Purpose: given an observation tensor, pick a discrete action.
+- load(path, device, ...): loads ONLY the actor_critic weights from the checkpoint
+  via extract_state_dict('actor_critic'); tokenizer/world_model flags are currently ignored.
+- act(obs, should_sample=True, temperature=1.0):
+    * Resizes obs to 64×64 (bilinear, antialiased), expecting shape B×C×H×W.
+    * Forwards through actor_critic and takes the last-step logits ([:, -1]).
+    * Applies temperature scaling; samples (Categorical) if should_sample else argmax.
+    * Returns a LongTensor of action indices with shape (B,).
+- device property reflects actor_critic.conv1.weight.device.
+
+Notes:
+- Caller must ensure obs is on the same device and correctly normalized.
+- The stored world_model is not consulted during act().
+"""
+
 from pathlib import Path
 
 import torch

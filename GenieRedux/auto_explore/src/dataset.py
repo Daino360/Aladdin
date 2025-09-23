@@ -1,3 +1,23 @@
+"""
+episodes_dataset.py: in-memory store for RL episodes with sampling and RAM-aware variants.
+
+- EpisodesDataset
+  • Keeps a deque of Episode objects with stable IDs and queue indices.
+  • Optional cap (max_num_episodes); evicts oldest when full.
+  • add_episode/update_episode: append new chunks or merge into existing episodes.
+  • sample_batch(batch_num_samples, sequence_length, sample_from_start):
+      - Randomly pick episodes, slice (or back-slice) fixed-length segments with padding,
+        collate into a batch of tensors; observations are scaled to [0,1] float.
+  • traverse(batch_num_samples, chunk_size): sequentially iterate episodes in fixed-size chunks,
+    yielding collated batches.
+  • Disk I/O: update_disk_checkpoint() saves only newly modified episodes and deletes
+    evicted ones; load_disk_checkpoint() restores from a directory of .pt files.
+
+- EpisodesDatasetRamMonitoring
+  • Drops the fixed-episode cap; instead enforces a RAM budget.
+  • max_ram_usage accepts '<percent>%' (system RAM) or '<gigabytes>G' (process RAM).
+  • Tracks total steps and evicts oldest episodes when the budget is exceeded.
+"""
 from collections import deque
 import math
 from pathlib import Path
