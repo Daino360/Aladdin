@@ -290,7 +290,20 @@ class EnvironmentDataGenerator:
 
                     cv2.imwrite(frame_fpath, frame[:, :, ::-1])
                 elif output_mode == OutputMode.VIDEO:
-                    # In VIDEO mode, do not write per-frame JPEGs; only encode to the MP4.
+                    frame_fpath = fs.get_frame_fpath(
+                        instance_id,
+                        session_id,
+                        tgt_frame_id,
+                        make_dirs=True,
+                    )
+
+                    cv2.imwrite(frame_fpath, frame[:, :, ::-1])
+                    frame_fpath = fs.get_frame_fpath(
+                        instance_id,
+                        session_id,
+                        tgt_frame_id,
+                        make_dirs=True,
+                    )
                     frame = av.VideoFrame.from_ndarray(frame, format="rgb24")
 
                     if video_stream is not None:

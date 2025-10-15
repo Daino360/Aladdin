@@ -1,7 +1,22 @@
 """
 Taken from https://github.com/MaxStrange/retrowrapper/blob/master/retrowrapper.py
 """
+"""
+retrowrapper.py: run multiple `retro` game environments safely by isolating each one
+in its own background process and proxying all API calls through queues.
 
+Why: the `retro` library is effectively limited to one env per Python process.
+This wrapper spawns a helper process that owns the env and forwards attribute
+access and method calls (e.g., .reset(), .step()) between your code and the env.
+
+Key pieces
+----------
+- set_retro_make(): let callers swap the factory used to create retro envs.
+- RetroWrapper: user-facing proxy that looks like a retro.Env.
+- _retrocom(): the target function run in the helper process that actually
+  holds the env and executes requests.
+- MAKE_RETRIES: retry creation in case the first attempt fails (gc/cleanup race).
+"""
 
 """
 This module exposes the RetroWrapper class.
@@ -13,6 +28,14 @@ import gc
 MAKE_RETRIES = 5
 
 def set_retro_make( new_retro_make_func ):
+    """
+    Override the function used to construct retro environments.
+
+    Parameters
+    ----------
+    new_retro_make_func : Callable
+        A drop-in replacement for `retro.make` taking (game, **kwargs).
+    """
     RetroWrapper.retro_make_func = new_retro_make_func
 
 def _retrocom(rx, tx, game, kwargs):
@@ -21,6 +44,28 @@ def _retrocom(rx, tx, game, kwargs):
     process and does all the work of communicating with the
     environment.
     """
+    """
+    Helper-process main loop: owns the env and answers requests.
+
+    Parameters
+    ----------
+    rx : multiprocessing.Queue
+        Queue from which this process RECEIVES (attr, args, kwargs) messages.
+    tx : multiprocessing.Queue
+        Queue to which this process SENDS results back.
+    game : str
+        Game name for `retro.make`.
+    kwargs : dict
+        Keyword args forwarded to the env factory.
+
+    Protocol
+    --------
+    - Special probe for callability: (RetroWrapper.symbol, attr, {}).
+      Respond with True/False.
+    - "close": close env and exit loop.
+    - General case: if the attribute is callable, call it with args/kwargs;
+      otherwise return the attribute value.
+    """    
     env = RetroWrapper.retro_make_func(game, **kwargs)
 
     # Sit around on the queue, waiting for calls from RetroWrapper
@@ -63,6 +108,17 @@ class RetroWrapper():
     retro_make_func = retro.make
 
     def __init__(self, game, **kwargs):
+        """
+        Create the proxy and spawn the helper process.
+
+        Steps
+        -----
+        1) Try to construct a temporary env (with a few retries + gc) to copy
+           static attributes (spaces, metadata, optional gamename/initial_state).
+        2) Tear down the temp env.
+        3) Spin up a background process running `_retrocom`, and set up two queues:
+           `_tx` (requests to child) and `_rx` (responses from child).
+        """        
         tempenv = None
         retry_counter = MAKE_RETRIES
         while True:

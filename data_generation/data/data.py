@@ -57,7 +57,6 @@ class DatasetFileStructure:
         self.actions_fpath: Path = self.session_fmtdpath / self.actions_fname
         # self.start_frame_fpath = self.root_dpath / "start_frame.png"
         self.start_frame_fpath = None
-        self.video_fmtdpath = self.session_fmtdpath / "frames.mp4"
 
     def get_action_fpath(self, instance_id, session_id, make_dirs=False):
         instance_id = int(instance_id)
@@ -213,26 +212,6 @@ class DatasetFileStructureInstance(DatasetFileStructure):
         else:
             fname = self.frame_fname
         fpath = dpath / fname
-        return str(fpath)
-
-    def get_video_fpath(self, session_id, session_props):
-        """
-        Returns the file path for a video in an instance.
-
-        Parameters:
-        - session_id (str): The ID of the session.
-
-        Returns:
-        - str: The file path of the video.
-        """
-
-        session_id_label = self.session_id_format.format(session_id)
-        fpath: Path = self.replace(
-            self.video_fmtdpath,
-            self.SESSION_ID,
-            session_id_label,
-        )  # type: ignore
-
         return str(fpath)
 
     def get_session_ids(self) -> list[int]:

@@ -1,3 +1,21 @@
+"""
+eval_auto_explore.py: evaluation entrypoint for the AutoExplore agent.
+
+What it does (briefly)
+----------------------
+- Loads a Hydra config for evaluation and resolves the checkpoint directory
+  by model id (using CheckpointDirManager).
+- Initializes Lightning Fabric (DDP, single device, bf16 mixed precision).
+- Switches into the run directory, sets up a simple file structure, and dumps
+  the resolved Hydra config for reproducibility.
+- Instantiates `Trainer` in resume/eval mode, forces evaluation-style epoch
+  semantics (start at epoch 1), enables per-epoch and final summaries,
+  and calls `trainer.run()` to perform evaluation rollouts and logging.
+
+Note: If running under SLURM, selected SLURM env vars are removed to avoid
+conflicts with Lightning’s launcher.
+"""
+
 import os
 from pathlib import Path
 import hydra
@@ -17,6 +35,21 @@ from tools.logger import getLogger
 log = getLogger(__name__)
 
 def run(cfg: DictConfig):
+    """
+    Orchestrate a single evaluation run using a Hydra config.
+
+    Steps
+    -----
+    1) Normalize important paths in the config (root, world model root).
+    2) Locate the checkpoint directory by resume_id with CheckpointDirManager.
+    3) Initialize and launch Lightning Fabric (DDP, selected accelerator, bf16).
+    4) Prepare run metadata: set W&B run name, mark resume=True, chdir to run dir.
+    5) Create a FileStructure under the run dir and dump the resolved config there.
+    6) Build a `Trainer` and adapt it for evaluation semantics:
+       - start from epoch 1 (treat `common.epochs` as "how many eval epochs")
+       - enable per-epoch + final evaluation summaries.
+    7) Call `trainer.run()` to execute the evaluation loop.
+    """
     cfg.common.root_dpath = os.path.abspath(cfg.common.root_dpath)
     cfg.world_model.root_dpath = os.path.abspath(cfg.world_model.root_dpath)
 
@@ -58,6 +91,11 @@ def run(cfg: DictConfig):
 
 @hydra.main(config_path="auto_explore/configs", config_name="evaluate")
 def main(cfg: DictConfig):
+    """
+    Hydra entrypoint:
+    - Parses the evaluation config from `auto_explore/configs/evaluate.yaml`.
+    - Delegates to `run(cfg)` to perform the evaluation.
+    """    
     run(cfg)
 
 
