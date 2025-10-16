@@ -92,13 +92,12 @@ dependencies:
       - stable-retro==0.9.5
       - stack-data==0.6.3
       - sympy==1.13.3
-      - torch==2.8.0+cu126
-      - torchvision==0.23.0+cu126
-      # - torch==2.8.0+cu129 #ADDEDBYME
-      # - torchvision==0.23.0+cu129 ##ADDEDBYME
       - tqdm==4.67.1
       - traitlets==5.14.3
       - triton==3.4.0
       - typing-extensions==4.14.0
       - tzdata==2025.2
       - wcwidth==0.2.13
+      - --extra-index-url https://download.pytorch.org/whl/cu126
+      - torch==2.8.0+cu126
+      - torchvision==0.23.0+cu126
