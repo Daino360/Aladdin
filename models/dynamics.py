@@ -1,3 +1,18 @@
+"""
+dynamics.py — transformer-based video dynamics (MaskGIT) + sampling & training losses
+-----------------------------------
+- Defines small helper utilities (masking schedules, Gumbel sampling, etc.).
+- Implements **MaskGIT**, a spatiotemporal transformer that predicts video tokens
+  (optionally conditioned on actions) from masked inputs.
+- Wraps MaskGIT in a **Dynamics** module that:
+  • computes training losses (cross-entropy, optional focal or distance-weighted),
+  • runs iterative masked token sampling to generate future tokens,
+  • exposes a forward pass used during training.
+
+In short: this is the model and logic that predict next video tokens given past tokens
+(and possibly actions), both for training and autoregressive-like masked sampling.
+"""
+
 import functools
 import math
 
@@ -14,32 +29,47 @@ log = getLogger(__name__)
 # helpers
 
 
+
 def exists(val):
+    """Return True if val is not None."""
     return val is not None
 
 
 def default(val, d):
+    """Return val if set, otherwise default d."""
     return val if exists(val) else d
 
 
 def cast_tuple(val, length=1):
+    """Ensure val is a tuple (repeat it to given length if needed)."""
     return val if isinstance(val, tuple) else (val,) * length
 
 
 def reduce_mult(arr):
+    """Multiply all elements in an iterable."""
     return functools.reduce(lambda x, y: x * y, arr)
 
 
 def pair(val):
+    """Force val into (val, val) unless it is already a 2-tuple."""
     ret = (val, val) if not isinstance(val, tuple) else val
     assert len(ret) == 2
     return ret
 
 
-# decorators
+# =========================
+# Decorators
+# =========================
 
 
 def eval_decorator(fn):
+    """
+    Run a module method in eval mode and restore the previous training state.
+
+    Usage:
+        @eval_decorator
+        def sample(...): ...
+    """    
     def inner(model, *args, **kwargs):
         was_training = model.training
         model.eval()
@@ -50,13 +80,26 @@ def eval_decorator(fn):
     return inner
 
 
+
+# =========================
+# RNG helpers
+# =========================
+
 # classifier free guidance functions
 def uniform(shape, device):
+    """Uniform(0,1) tensor of the given shape on device."""
     return torch.zeros(shape, device=device).float().uniform_(0, 1)
+
+
+
+# =========================
+# Tensor helpers
+# =========================
 
 
 # tensor helper functions
 def logarithm(t, eps=1e-10):
+    """Numerically-stable log(t)."""
     return torch.log(t + eps)
 
 
@@ -81,8 +124,9 @@ def apply_bernoulli_mask(mask, prob):
     return mask
 
 
-# sampling helpers
-
+# =========================
+# Sampling helpers
+# =========================
 
 def gumbel_noise(t):
     """
@@ -114,6 +158,9 @@ def gumbel_sample(t, temperature=1.0, dim=-1):
 
 
 def top_k(logits, thres=0.5):
+    """
+    Keep top-K (by threshold ratio) logits, set the rest to -inf (for softmax top-k).
+    """    
     num_logits = logits.shape[-1]
     k = max(int((1 - thres) * num_logits), 1)
     val, ind = torch.topk(logits, k)
@@ -161,13 +208,24 @@ def mask_ratio_schedule(ratio, total_unknown, method="cosine"):
     return mask_ratio
 
 
+# =========================
+# Losses
+# =========================
+
 class FocalLoss(nn.Module):
+    """Standard focal loss wrapper for classification imbalances."""
     def __init__(self, gamma=2, reduction="mean"):
         super().__init__()
         self.gamma = gamma
         self.reduction = reduction
 
     def forward(self, inputs, targets, alpha=1):
+        """
+        Args:
+            inputs: logits (B, C)
+            targets: class indices (B,)
+            alpha: class-balancing factor
+        """        
         ce_loss = F.cross_entropy(inputs, targets, reduction="none")
         pt = torch.exp(-ce_loss)
         loss = alpha * ((1 - pt) ** self.gamma) * ce_loss
@@ -181,6 +239,10 @@ class FocalLoss(nn.Module):
 
 
 class DistanceWeightedCrossEntropyLoss(nn.Module):
+    """
+    Cross-entropy auxiliary term that penalizes placing probability mass on
+    codebook entries that are far (cosine distance) from the target entry.
+    """    
     def __init__(self, codebook, _lamda=1):
         super(DistanceWeightedCrossEntropyLoss, self).__init__()
         self.pairwise_distances = self._compute_pairwise_distances(codebook)
@@ -241,6 +303,10 @@ class DistanceWeightedCrossEntropyLoss(nn.Module):
 
         return loss
 
+
+# =========================
+# MaskGIT Model
+# =========================
 
 class MaskGIT(nn.Module):
     """
@@ -429,6 +495,7 @@ class MaskGIT(nn.Module):
         video_shape = (b, t, h, w)
         mask = video_tokens_ids == self.mask_id
 
+        # Optionally mix in codebook vectors for masked tokens (use_token=True)
         if self.use_token:
             if tokenizer is None:
                 raise ValueError("Tokenizer must be provided when use_token is True")
@@ -473,6 +540,7 @@ class MaskGIT(nn.Module):
         spatial_pattern = "(b t) (h w) d"
         temporal_pattern = "(b h w) t d"
 
+        # transformer over space-time
         video_tokens = self.transformer(
             video_action_tokens,
             pattern=pattern,
@@ -498,9 +566,17 @@ class MaskGIT(nn.Module):
         return self.to_logits(video_tokens)
 
 
+# =========================
+# Dynamics wrapper
+# =========================
+
 class Dynamics(nn.Module):
     """
     Dynamics module for handling the dynamics of the Genie model.
+    Wraps MaskGIT with:
+      - training losses (CE / focal / distance-weighted CE),
+      - iterative masked sampling (schedule-controlled),
+      - convenience forward for training
 
     Args:
         maskgit (GenieMaskGit): The GenieMaskGit model for token prediction.
@@ -519,6 +595,17 @@ class Dynamics(nn.Module):
         use_focal_loss=False,
         use_distance_weighted_loss=False,
     ):
+        """
+        Args:
+            maskgit: the MaskGIT backbone
+            tokenizer_codebook: (optional) codebook tensor for distance-weighted loss
+            inference_steps: # of iterative steps during sampling
+            sample_temperature: base temperature for Gumbel sampling
+            mask_schedule: schedule name for progressive unmasking
+            use_cross_entropy_loss / use_focal_loss / use_distance_weighted_loss:
+                pick one CE-style loss (asserted mutually exclusive for CE vs focal)
+        """
+
         assert use_cross_entropy_loss != use_focal_loss, (
             "Only one CE loss function can be used at a time"
         )
@@ -542,6 +629,14 @@ class Dynamics(nn.Module):
             )
 
     def loss_function(self, logits, target_indices, accelerator_tracker_dict=None):
+        """
+        Combine the enabled CE-style losses and (optionally) log them via an accelerator tracker.
+
+        Args:
+            logits: (M, C) model logits on masked positions
+            target_indices: (M,) ground-truth token ids for those positions
+            accelerator_tracker_dict: optional dict with {'tracker','step'} for logging
+        """        
         loss = 0
         use_loss_tracking = accelerator_tracker_dict is not None
 
@@ -614,6 +709,8 @@ class Dynamics(nn.Module):
     ):
         """
         Compute confidence scores for predicted tokens.
+        Convert logits into per-token "uncertainty" scores in [0,1] (1 - prob at predicted id).
+        Only keep scores on masked positions; set others to a large negative sentinel.
 
         Args:
             patch_shape (tuple): Shape of the video patch.
@@ -654,6 +751,7 @@ class Dynamics(nn.Module):
     ):
         """
         Sample video frames based on actions and prime frames.
+        Iterative masked-token sampling (MaskGIT-style).        
 
         Args:
             num_frames (int): Number of frames to generate.
@@ -757,6 +855,8 @@ class Dynamics(nn.Module):
     ):
         """
         Forward pass of the Dynamics module.
+        Takes target token ids, masks a random fraction, runs MaskGIT on the masked
+        inputs, and computes the configured loss on the masked positions.        
 
         Args:
             video_codebook_ids (torch.Tensor): Video codebook IDs.

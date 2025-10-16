@@ -27,6 +27,7 @@ log = getLogger(__name__)
 
 
 def exists(val):
+    """Small helper to check for non-None values."""    
     return val is not None
 
 
@@ -71,6 +72,19 @@ def accum_log(log, new_logs):
 # Define a conditional context manager
 @contextmanager
 def conditional_with(context_manager, condition):
+    """
+    Enter a context manager only if a condition holds.
+
+    Useful for skipping `no_sync()` on the last gradient accumulation step.
+
+    Args:
+        context_manager: Any context manager (e.g., accelerator.no_sync()).
+        condition: If True, enter the context; otherwise do nothing.
+
+    Usage:
+        with conditional_with(accel.no_sync(model), i < accum-1):
+            ...
+    """    
     if condition:
         # If condition is true, enter the context manager
         with context_manager:
@@ -80,13 +94,27 @@ def conditional_with(context_manager, condition):
         yield
 
 
-# main trainer class
+# =========================
+#       Main Trainer
+# =========================
+
 @beartype
 class Trainer(nn.Module):
     """
     A trainer class for various models including Tokenizer, LatentActionModel, Genie, and GroundTruthActionDynamics.
 
     This class handles the training loop, evaluation, logging, and saving of models.
+    """
+    """
+    Orchestrates optimization, evaluation, logging and checkpointing.
+
+    Supports:
+      • Tokenizer
+      • LatentActionModel
+      • GenieRedux / GenieReduxGuided
+
+    Uses HuggingFace Accelerate to handle mixed precision and distributed
+    training transparently.
     """
 
     def __init__(
@@ -157,6 +185,10 @@ class Trainer(nn.Module):
         """
         super().__init__()
 
+        # ---------------------------
+        # Store configuration / flags
+        # ---------------------------
+
         # Initialize instance variables
         self.image_size = model.image_size
         self.save_model = save_model
@@ -179,6 +211,11 @@ class Trainer(nn.Module):
         # Determine the type of model
         self.is_genie = isinstance(model, (GenieRedux, GenieReduxGuided))
         self.is_lam = isinstance(model, LatentActionModel)
+
+
+        # ---------------------------
+        # Accelerator setup
+        # ---------------------------
 
         if accelerator is not None:
             self.accelerator = accelerator
@@ -208,6 +245,10 @@ class Trainer(nn.Module):
         self.batch_size = batch_size
         self.grad_accum_every = grad_accum_every
 
+        # ---------------------------
+        # Optimizer + Scheduler
+        # ---------------------------
+
         # Set up optimizer and scheduler
         self.optim = get_optimizer(
             model.trainable_parameters(), lr=lr, wd=wd, betas=adam_betas
@@ -221,6 +262,11 @@ class Trainer(nn.Module):
         )
 
         self.max_grad_norm = max_grad_norm
+
+
+        # ---------------------------
+        # Dataset split / loaders
+        # ---------------------------
 
         # Set up dataloaders
         if isinstance(dataset, tuple):
@@ -315,6 +361,8 @@ class Trainer(nn.Module):
                 }
             },
         )
+
+    # ------------- Utilities -------------
 
     def load_log_data(self):
         """
@@ -418,6 +466,9 @@ class Trainer(nn.Module):
     def is_local_main(self):
         """Check if this is the local main process."""
         return self.accelerator.is_local_main_process
+
+
+    # ------------- Training / Validation -------------
 
     def train_step(self, *args, **kwargs):
         """
@@ -664,7 +715,10 @@ class Trainer(nn.Module):
 
     def train(self, *args, **kwargs):
         """
-        Main training loop.
+        Run the main training loop until `num_train_steps` is reached.
+
+        Displays a tqdm progress bar on the main process and updates it
+        every step with the current training loss.
         """
         with tqdm(
             initial=self.step, total=self.num_train_steps, disable=not self.is_main

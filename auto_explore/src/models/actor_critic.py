@@ -1,3 +1,10 @@
+"""
+actor_critic.py: recurrent policy+value network for discrete control, with
+optional IMPALA encoder and utilities to (a) roll out on given observations
+(“imagine_none”) and (b) roll out in a real env while optionally probing a
+world model (“imagine_gt”). Includes an A2C/GAE-style loss using λ-returns.
+"""
+
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Optional, Union
@@ -27,22 +34,32 @@ log = getLogger(__name__)
 
 @dataclass
 class ActorCriticOutput:
-    logits_actions: torch.FloatTensor
-    means_values: torch.FloatTensor
+    """Outputs of a single policy forward pass."""
+    logits_actions: torch.FloatTensor  # (B, 1, A) unnormalized logits over discrete actions
+    means_values: torch.FloatTensor    # (B, 1, 1) scalar state-value estimate
 
 
 @dataclass
 class ImagineOutput:
-    observations: torch.ByteTensor
-    actions: torch.LongTensor
-    logits_actions: torch.FloatTensor
-    values: torch.FloatTensor
-    rewards: torch.FloatTensor
-    ends: torch.BoolTensor
+    """Container for imagined/rolled-out trajectories."""
+    observations: torch.ByteTensor     # (B, T, C, H, W) uint8 frames
+    actions: torch.LongTensor          # (B, T) sampled action ids
+    logits_actions: torch.FloatTensor  # (B, T, A) policy logits per step
+    values: torch.FloatTensor          # (B, T) value predictions
+    rewards: torch.FloatTensor         # (B, T) rewards used for learning
+    ends: torch.BoolTensor             # (B, T) done flags (True at terminal steps)
 
 
 class ActorCritic(nn.Module):
+    """
+    Recurrent actor-critic with either a small ConvNet or IMPALA encoder + LSTM.
+
+    - Encoder: 4-layer CNN (to 1024) or ImpalaCNN (to 512).
+    - Core: LSTMCell(encoder_out -> 512).
+    - Heads: policy logits (→ act_vocab_size) and scalar value.
+    """    
     def __init__(self, act_vocab_size, use_original_obs: bool = False, use_impala:bool = False) -> None:
+        """Configure encoder type and build recurrent core + policy/value heads."""
         super().__init__()
         self.use_original_obs = use_original_obs
         
@@ -71,12 +88,18 @@ class ActorCritic(nn.Module):
         self.actor_linear = nn.Linear(512, act_vocab_size)
         
     def __repr__(self) -> str:
+        """Nice short name for logging/metrics prefixes."""
         return "actor_critic"
 
     def clear(self) -> None:
+        """Forget LSTM hidden-state (e.g., at end of rollout/imagination)."""
         self.hx, self.cx = None, None
 
     def reset(self, n: int, burnin_observations: Optional[torch.Tensor] = None, mask_padding: Optional[torch.Tensor] = None) -> None:
+        """
+        Initialize LSTM state for a batch of size n; optionally “burn in”
+        with a short sequence to warm up the recurrent state where mask_padding=True.
+        """
         device = self.conv1.weight.device
 
         self.hx = torch.zeros(n, self.lstm_dim, device=device, dtype=torch.bfloat16)
@@ -95,10 +118,18 @@ class ActorCritic(nn.Module):
                         self(burnin_observations[:, i], mask_padding[:, i])
 
     def prune(self, mask: np.ndarray) -> None:
+        """Keep only rows where mask is True in the LSTM states (e.g., after env pruning)."""
         self.hx = self.hx[mask]
         self.cx = self.cx[mask]
 
     def forward(self, inputs, mask_padding: Optional[torch.BoolTensor] = None) -> ActorCriticOutput:
+        """
+        One recurrent policy step.
+
+        Expects inputs in [0,1], shape (B, 3, 64, 64) (resized here if needed).
+        If mask_padding is provided, only those rows update the recurrent state.
+        Returns (logits over actions, value).
+        """        
         inputs = F.interpolate(inputs, size=(64, 64), mode='bilinear', align_corners=False, antialias=True)
         assert inputs.ndim == 4 and inputs.shape[1:] == (3, 64, 64)
         epsilon = 1e-6
@@ -127,6 +158,15 @@ class ActorCritic(nn.Module):
         return ActorCriticOutput(logits_actions, means_values)
 
     def compute_loss(self, batch: Batch, world_model: GenieReduxGuided, imagine_horizon: int, gamma: float, lambda_: float, entropy_weight: float, **kwargs: Any) -> LossWithIntermediateLosses:
+        """
+        A2C-style loss on a rollout “imagined” directly from batch observations.
+
+        - Builds a trajectory with imagine_none (actions sampled from the policy).
+        - Computes λ-returns (bootstrapped with predicted values).
+        - Policy loss: advantage-weighted log-prob (negative).
+        - Entropy regularization (encourages exploration).
+        - Value loss: MSE(values, λ-returns).
+        """        
         assert not self.use_original_obs
         
         outputs = self.imagine_none(batch, horizon=imagine_horizon)
@@ -153,6 +193,14 @@ class ActorCritic(nn.Module):
     
 
     def imagine_none(self, batch: Batch, horizon: int, show_pbar: bool = False) -> ImagineOutput:
+        """
+        “Roll out” on the given ground-truth observation sequence (no env/world model).
+        At each time step:
+          - feed the current frame to the policy,
+          - sample an action,
+          - record logits and value (rewards/ends are taken from the batch).
+        Note: the provided `horizon` is ignored; uses the batch length instead.
+        """        
         assert not self.use_original_obs
         initial_observations = batch['observations']
         rewards = batch['rewards']
@@ -203,6 +251,15 @@ class ActorCritic(nn.Module):
 
 
     def imagine_gt(self, batch: Batch, world_model: GenieReduxGuided, horizon: int, show_pbar: bool = False) -> ImagineOutput:
+        """
+        Roll out actions in a *real* parallel env (here hardcoded to SMB) for `horizon`
+        steps; preprocess observations; sample actions from the policy each step; and
+        optionally probe the world model to derive an intrinsic reward signal.
+
+        Returns an ImagineOutput with captured (obs, actions, logits, values) and
+        rewards/ends measured during the env rollout (rewards here are set from
+        a world-model entropy proxy if that block is reached).
+        """
         assert not self.use_original_obs
         initial_observations = batch['observations']
         mask_padding = batch['mask_padding']
@@ -254,6 +311,7 @@ class ActorCritic(nn.Module):
         transform = transforms["train"]
 
         def process_obs(obs, dtype, transform):
+            """Apply transform per-frame and convert to device/dtype tensor."""
             new_obs = []
             for ob in obs:
                 ob = transform(ob)
@@ -288,7 +346,8 @@ class ActorCritic(nn.Module):
             all_values.append(outputs_ac.means_values)
             # all_rewards.append(torch.tensor(reward).reshape(-1, 1))
             all_ends.append(torch.tensor(done).reshape(-1, 1))
-
+            
+            # Optionally use the world model to compute an entropy-based pseudo-reward
             if k+1 % (n_preds + n_input_frames) == 0:
                 #convert all_observations to a single torch array with torch stack
                 wm_observations = torch.stack(all_observations[-(n_input_frames + n_preds):-n_input_frames], dim=1)

@@ -1,3 +1,20 @@
+"""
+data.py: multi-environment video dataset utilities + image/video I/O helpers.
+--------------------
+- Tiny helpers for images/videos (PIL↔tensor, GIF read/write, clamping).
+- A simple ImageDataset for plain image folders.
+- Dataset file-structure wrappers to read per-session action JSON and frames.
+- Two dataset variants:
+  * EnvironmentDataset — one environment root; slices fixed-length sequences.
+  * MultiEnvironmentDataset — merges many EnvironmentDataset roots into one view.
+- Optional disk caching of metadata / sequence indices (feather).
+- Multiple output formats (IVG / PVG / LAM / VICREG / GENERAL) for different
+  training setups.
+- TransformsGenerator builds consistent resize/crop (and optional color jitter).
+- EnvironmentDatasetTester quickly visualizes samples to PNGs.
+"""
+
+
 import json
 import logging
 import math
@@ -5,7 +22,7 @@ import random
 from multiprocessing import Lock, cpu_count
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Tuple
 
 import cv2
 import numpy as np
@@ -18,6 +35,8 @@ from torch.utils.data import Dataset, Subset
 from torchvision import transforms
 from torchvision import transforms as T
 from tqdm import tqdm
+
+
 
 from data_generation.data.data import (
     DEFAULT_VERSION,
@@ -44,6 +63,11 @@ def pair(val):
 
 
 def cast_num_frames(t, *, frames):
+    """
+    Pad or trim a (B, F, ...) tensor along the frame dimension to exactly `frames`.
+    - If F > frames: truncate
+    - If F < frames: right-pad with zeros
+    """    
     f = t.shape[1]
 
     if f == frames:
@@ -56,6 +80,7 @@ def cast_num_frames(t, *, frames):
 
 
 def convert_image_to_fn(img_type, image):
+    """Convert a PIL image to a specific mode (e.g., 'RGB') if needed."""
     if image.mode != img_type:
         return image.convert(img_type)
     return image
@@ -65,7 +90,11 @@ def convert_image_to_fn(img_type, image):
 
 
 class ImageDataset(Dataset):
+    """Loads images from a folder and applies a standard resize/crop/flip pipeline."""
     def __init__(self, folder, image_size, exts=["jpg", "jpeg", "png"]):
+        """
+        Scan `folder` recursively for images and prepare torchvision transforms.
+        """        
         super().__init__()
         self.folder = folder
         self.image_size = image_size
@@ -87,6 +116,7 @@ class ImageDataset(Dataset):
         return len(self.paths)
 
     def __getitem__(self, index):
+        """Load one image and apply transforms -> tensor in [0, 1]."""
         path = self.paths[index]
         img = Image.open(path)
         return self.transform(img)
@@ -101,6 +131,10 @@ CHANNELS_TO_MODE = {1: "L", 3: "RGB", 4: "RGBA"}
 
 
 def seek_all_images(img, channels=3):
+    """
+    Iterate all frames in a PIL Image (e.g., GIF), converting to desired mode.
+    Yields PIL images frame-by-frame.
+    """    
     assert channels in CHANNELS_TO_MODE, f"channels {channels} invalid"
     mode = CHANNELS_TO_MODE[channels]
 
@@ -118,6 +152,10 @@ def seek_all_images(img, channels=3):
 
 
 def video_tensor_to_pil_images(tensor, only_first_image=True):
+    """
+    Convert video (C, F, H, W) tensor in [0,1] to PIL image(s).
+    If `only_first_image`, return the first frame; otherwise a horizontal strip.
+    """    
     tensor = torch.clamp(tensor, min=0, max=1)  # clipping underflow and overflow
 
     if only_first_image:
@@ -130,6 +168,10 @@ def video_tensor_to_pil_images(tensor, only_first_image=True):
 def video_tensor_to_gif(
     tensor, path, duration=120, loop=0, optimize=True, actions=None
 ):
+    """
+    Save a (C, F, H, W) video tensor as a GIF at `path`.
+    Returns the sequence of PIL frames used.
+    """
     tensor = torch.clamp(tensor, min=0, max=1)  # clipping underflow and overflow
     images = map(T.ToPILImage(), tensor.unbind(dim=1))
 
@@ -149,12 +191,19 @@ def video_tensor_to_gif(
 
 
 def gif_to_tensor(path, channels=3, transform=T.ToTensor()):
+    """
+    Load a GIF into a (C, F, H, W) tensor using `transform` on each frame.
+    """    
     img = Image.open(path)
     tensors = tuple(map(transform, seek_all_images(img, channels=channels)))
     return torch.stack(tensors, dim=1)
 
 
 def tqdm_function_decorator(total, *args, **kwargs):
+    """
+    Decorator factory that wraps a function and advances a tqdm progress bar
+    every time the function is called.
+    """    
     class PbarFunctionDecorator(object):
         def __init__(self, func):
             self.func = func
@@ -204,14 +253,18 @@ class DatasetOutputFormat:
 
 
 class CombinedEnvironmentDataset(Dataset):
+    """Wrap multiple datasets and interleave their samples uniformly."""
+
     def __init__(self, datasets: List[Dataset]) -> None:
         super().__init__()
         self.datasets = datasets
 
     def __len__(self):
+        """Combined logical length (balanced across component datasets)."""
         return len(self.datasets) * max([len(dataset) for dataset in self.datasets])
 
     def __getitem__(self, idx):
+        """Map global idx to (dataset_id, sample_id) and return the sample."""
         dataset_id = idx % len(self.datasets)
         dataset = self.datasets[dataset_id]
         sample_id = math.floor(idx / len(self.datasets)) % len(dataset)
@@ -220,6 +273,11 @@ class CombinedEnvironmentDataset(Dataset):
 
 
 class MultiEnvironmentDataset(Dataset):
+    """
+    Build an aggregated dataset from many environment roots on disk.
+    Each sub-root is loaded as an EnvironmentDataset (in parallel),
+    optionally whitelisted or limited to the first/last N envs.
+    """    
     def __init__(
         self,
         root_dpath,
@@ -237,7 +295,6 @@ class MultiEnvironmentDataset(Dataset):
         enable_cache: bool = True,
         cache_dpath: str = "cache",
         occlusion_mask: np.ndarray | None = None,
-        source_dataset: Optional["MultiEnvironmentDataset"] = None,
         n_workers: int = 46,
         n_envs: int = 0,
         whitelist: list[str] = None,
@@ -310,21 +367,9 @@ class MultiEnvironmentDataset(Dataset):
 
         # paths = paths[-200:]
 
-        # Optional: reuse per-environment metadata from an existing MultiEnvironmentDataset
-        self.env_dataset_lookup = None
-        if source_dataset is not None:
-            self.env_dataset_lookup = {}
-            for ds in source_dataset.datasets:
-                base = ds.dataset if isinstance(ds, Subset) else ds
-                env_root = str(base.fsl.fs.root_dpath)
-                self.env_dataset_lookup[env_root] = base
-
         def create_environment_dataset(path, id):
             self.log.d(f"Creating dataset {id} from {path}")
             try:
-                source_dataset = None
-                if self.env_dataset_lookup is not None:
-                    source_dataset = self.env_dataset_lookup[str(path)]
                 dataset = EnvironmentDataset(
                     root_dpath=path,
                     seq_length_input=seq_length_input,
@@ -341,7 +386,6 @@ class MultiEnvironmentDataset(Dataset):
                     enable_cache=enable_cache,
                     cache_dpath=cache_dpath,
                     occlusion_mask=occlusion_mask,
-                    source_dataset=source_dataset,
                 )
             except KeyError as e:
                 self.log.e(f"KeyError loading dataset from {path}: {e}")
@@ -380,6 +424,10 @@ class MultiEnvironmentDataset(Dataset):
         return self.size
 
     def __getitem__(self, idx):
+        """
+        Map a global index to the corresponding dataset & local index, and return
+        that sample.
+        """        
         # find out in which range in cummulative size the idx falls in
         dataset_id = np.argmax(self.cummulative_size > idx)
         new_idx = idx - self.cummulative_size[dataset_id - 1] if dataset_id > 0 else idx
@@ -399,8 +447,22 @@ class MultiEnvironmentDataset(Dataset):
         # self.current_dataset_id = (self.current_dataset_id + 1) % self.n_datasets
         return item
 
+# -----------------------------------------------------------------------------
+# EnvironmentDataset — one environment root
+# -----------------------------------------------------------------------------
 
 class EnvironmentDataset(Dataset):
+    """
+    Sequence dataset backed by DatasetFileStructure with optional caching.
+
+    Flow:
+    - Read dataset `info.json` (action/observation spaces, version, name)
+    - Scan sessions, read per-frame action JSON → DataFrame per instance
+    - Build train/val/test/all split (by instance/session/frame)
+    - Materialize fixed-length sequence descriptors (start, ids, actions, ...)
+    - __getitem__ loads frames in parallel, applies transforms, returns dict
+      in requested format (IVG / PVG / LAM / VICREG / GENERAL)
+    """    
     __DATASET_SPLIT = {
         "train": [0, 0.9],
         "validation": [0.9, 0.99],
@@ -425,7 +487,6 @@ class EnvironmentDataset(Dataset):
         enable_cache: bool = True,
         cache_dpath: str = "cache",
         occlusion_mask: np.ndarray | None = None,
-        source_dataset: Optional["EnvironmentDataset"] | None = None,
     ) -> None:
         """
         Initializes the Data class.
@@ -444,7 +505,7 @@ class EnvironmentDataset(Dataset):
         """
 
         self.seq_length_input = seq_length_input
-        self.seq_length_current = seq_length_input
+        self.seq_length_variable = seq_length_input
         self.seq_step = seq_step
         self.enable_test = enable_test
         self.format = format
@@ -473,22 +534,11 @@ class EnvironmentDataset(Dataset):
         )
         self.actions_shape = self.info["action_space"]
 
-        # Determine output mode from generator config (frame vs video). Default to frames.
-        self.output_mode = str(self.info["generator_config"]["output_mode"]).lower()
-
-        # Reuse file structure library from a base dataset if it points to the same root
-        if source_dataset is not None:
-            assert str(source_dataset.fsl.fs.root_dpath) == str(Path(root_dpath))
-            self.fsl = source_dataset.fsl
-        else:
-            self.fsl = DatasetFileStructureSessionLibrary(
-                root_dpath, version=Version(self.info["version"]), extension=img_ext
-            )
-
+        self.fsl = DatasetFileStructureSessionLibrary(
+            root_dpath, version=Version(self.info["version"]), extension=img_ext
+        )
         self.lock = Lock()
         self.data = {}
-        # Ensure attribute exists before first use in __getitem__
-        self.n_actions = None
 
         # Set up cache
         self.enable_cache = enable_cache
@@ -498,63 +548,25 @@ class EnvironmentDataset(Dataset):
             self.cache_metadata_fpath = (
                 self.cache_dpath / f"metadata_{self.name}_{self.fsl.version}.feather"
             )
+            if self.clip_length > 0:
+                self.cache_data_seq_fpath = (
+                    self.cache_dpath
+                    / f"dataseq_{self.split_type}_{self.__DATASET_SPLIT[self.split][0]}_{self.__DATASET_SPLIT[self.split][1]}_{self.name}_{self.fsl.version}_{self.seq_length_variable}_{self.seq_step}_{self.clip_length}.feather"
+                )
+            else:
+                self.cache_data_seq_fpath = (
+                    self.cache_dpath
+                    / f"dataseq_{self.split_type}_{self.__DATASET_SPLIT[self.split][0]}_{self.__DATASET_SPLIT[self.split][1]}_{self.name}_{self.fsl.version}_{self.seq_length_variable}_{self.seq_step}.feather"
+                )
 
-        # Keep a reference to base metadata to enable split views and reuse.
-        if source_dataset is not None and hasattr(source_dataset, "metadata_base"):
-            self.metadata_base = source_dataset.metadata_base
-        elif source_dataset is not None and hasattr(source_dataset, "metadata_full"):
-            # Backward-compat for any code still using metadata_full
-            self.metadata_base = source_dataset.metadata_base
-        else:
-            self.metadata_base = self.__create_metadata()
-
-        self.metadata = self.__build_split(self.metadata_base, split, split_type)
-
+        self.metadata = self.__create_metadata()
         self.n_instances = len(list(self.metadata.keys()))
         self.max_size = max_size
+        self.split = split
+        self.split_type = split_type
 
-        self.sessions_info = self._build_sessions_from_metadata()
-        self._recompute_window_index()
-
-    def _build_sessions_from_metadata(self):
-        sessions_info = []
-        for inst_id, df in self.metadata.items():
-            for sess_id, group in df.groupby("session_id"):
-                first_start = 0 if self.fsl.fs.start_frame_fpath is None else 1
-                sessions_info.append(
-                    {
-                        "instance_id": inst_id,
-                        "session_id": int(sess_id),
-                        "group": group.reset_index(drop=True),
-                        "first_start": first_start,
-                    }
-                )
-        return sessions_info
-
-    def _recompute_window_index(self):
-        seq_len = self.seq_length_current
-        n_per = []
-        for sess in self.sessions_info:
-            group = sess["group"]
-            first = sess["first_start"]
-            L = (
-                min(len(group), self.clip_length)
-                if self.clip_length > 0
-                else len(group)
-            )
-            last_exclusive = L - seq_len
-            if last_exclusive <= first - 1:
-                n = 0
-            else:
-                n = math.ceil((last_exclusive - first) / self.seq_step)
-            n_per.append(max(0, n))
-        self.n_windows_per_session = n_per
-        self.cum_windows = (
-            np.cumsum(self.n_windows_per_session) if n_per else np.array([], dtype=int)
-        )
-        self.total_windows = (
-            int(self.cum_windows[-1]) if len(self.cum_windows) > 0 else 0
-        )
+        self.metadata = self.__build_split(self.metadata, split, split_type)
+        self.data = self.__create_data(self.seq_length_variable)
 
     @staticmethod
     def __read_info(info_fpath):
@@ -606,12 +618,13 @@ class EnvironmentDataset(Dataset):
                 int(math.floor(n_elements * self.__DATASET_SPLIT[split][0])),
                 int(math.floor(n_elements * self.__DATASET_SPLIT[split][1])),
             )
-            new_metadata = {id: metadata[id] for id in dataset_split}
 
+            metadata = {id: metadata[id] for id in dataset_split}
         elif split_type == "session":
-            new_metadata = {}
             for i in range(n_elements):
+                # get all unique values of session_id in the dataframe metadata[i]
                 session_ids = sorted(list(metadata[i]["session_id"].unique()))
+
                 session_ids = session_ids[
                     int(
                         math.floor(len(session_ids) * self.__DATASET_SPLIT[split][0])
@@ -619,14 +632,11 @@ class EnvironmentDataset(Dataset):
                         math.floor(len(session_ids) * self.__DATASET_SPLIT[split][1])
                     )
                 ]
-                new_metadata[i] = metadata[i][
-                    metadata[i]["session_id"].isin(session_ids)
-                ]
-
+                # select only those elements of metadata[i] which elements are in session_ids
+                metadata[i] = metadata[i][metadata[i]["session_id"].isin(session_ids)]
         elif split_type == "frame":
-            new_metadata = {}
             for i in range(n_elements):
-                new_metadata[i] = metadata[i].iloc[
+                metadata[i] = metadata[i].iloc[
                     int(
                         math.floor(
                             len(metadata[i].index) * self.__DATASET_SPLIT[split][0]
@@ -641,10 +651,19 @@ class EnvironmentDataset(Dataset):
         else:
             raise ValueError(f"Invalid split type: {split_type}")
 
-        return new_metadata
+        # #assert that the intervals in dataset_split are not intersecting
+        # for split1 in dataset_split:
+        #     for split2 in dataset_split:
+        #         if split1 != split2:
+        #             assert len(set(dataset_split[split1]).intersection(set(dataset_split[split2]))) == 0
 
+        return metadata
 
     def __create_metadata(self):
+        """
+        Build a dict: {instance_id: DataFrame(src_frame_id, tgt_frame_id, action, session_id, ...)}.
+        Uses feather cache when present; otherwise scans sessions and reads action JSON.
+        """        
         has_read_error = False
         if self.enable_cache and self.cache_metadata_fpath.exists():
             self.log.d("Loading metadata from cache... : ", self.cache_metadata_fpath)
@@ -657,11 +676,23 @@ class EnvironmentDataset(Dataset):
                             metadata_from_file["instance_id"] == instance_id
                         ]
 
-                except (EOFError, OSError, Exception) as e:
+                except EOFError:
                     self.log.e(
-                        f"Error loading metadata from cache: {self.cache_metadata_fpath} ({type(e).__name__}: {e})"
+                        f"EOFError loading metadata from cache: {self.cache_metadata_fpath}"
                     )
                     has_read_error = True
+                except OSError:
+                    self.log.e(
+                        f"OSError loading metadata from cache: {self.cache_metadata_fpath}"
+                    )
+                    has_read_error = True
+                except Exception:
+                    self.log.e(
+                        f"Error loading metadata from cache: {self.cache_metadata_fpath}"
+                    )
+                    has_read_error = True
+                finally:
+                    pass
         if (
             not (self.enable_cache and self.cache_metadata_fpath.exists())
             or has_read_error
@@ -747,66 +778,97 @@ class EnvironmentDataset(Dataset):
 
         return metadata
 
+    def __create_data(self, seq_length_variable):
+        """
+        Materialize the list of sequence descriptors used by __getitem__:
+        [{'group': df, 'env_instance_id': id, 'env_session_id': sid, 'seq_start': i}, ...]
+        """        
+        self.seq_length_current = seq_length_variable
+        self.n_actions = None
+
+        data = []
+        seq_length = seq_length_variable
+
+        if len(self.metadata) == 0:
+            self.n_instances = 0
+            raise ValueError(f"Empty dataset! : {self.name}")
+
+        # build the data list
+        @tqdm_function_decorator(
+            total=math.ceil(len(self.metadata)), disable=len(self.metadata) <= 150
+        )
+        def process_metadata(args):
+            """
+            For one instance, slice each session into fixed-length windows (stride = seq_step),
+            honoring optional session property filters.
+            """            
+            (metadata_key, metadata_entry, seq_length, seq_step, session_filter) = args
+            metadata_entry_groups = metadata_entry.groupby("session_id")
+            if session_filter is not None:
+                metadata_entry_groups = [
+                    (session_id, group)
+                    for key in session_filter.keys()
+                    for session_id, group in metadata_entry_groups
+                    if group.iloc[0][key] in session_filter[key]
+                ]
+
+            data = []
+            for session_id, group in metadata_entry_groups:
+                first_start_id = 0 if self.fsl.fs.start_frame_fpath is None else 1
+                if self.clip_length > 0:
+                    len_group = min(len(group), self.clip_length)
+                else:
+                    len_group = len(group)
+
+                last_start_id = len_group - seq_length
+
+                if last_start_id >= 0:
+                    for i in range(first_start_id, last_start_id, seq_step):
+                        data_entry = {
+                            "group": group,
+                            "env_instance_id": metadata_key,
+                            "env_session_id": session_id,
+                            "seq_start": i,
+                        }
+                        data.append(data_entry)
+            return data
+
+        with ThreadPool(processes=1) as pool:
+            results = pool.imap(
+                process_metadata,
+                [
+                    (
+                        metadata_key,
+                        metadata_entry,
+                        seq_length,
+                        self.seq_step,
+                        self.session_filter,
+                    )
+                    for metadata_key, metadata_entry in self.metadata.items()
+                ],
+                chunksize=500,
+            )
+            data = [entry for sublist in results for entry in sublist]
+
+        return data
+
     def _read_frames(
         self,
-        fpath,
+        frame_fpath,
         start_frame_fpath,
         frame_ids,
         scaling_factor=1,
         transform=None,
-        output_mode="frame",
     ):
         """Read frames from a folder."""
+        """
+        Read a list of frames (OpenCV) in parallel, resize + BGR→RGB, and apply optional transform.
+        Honors `start_frame_fpath` for frame 0 if present. Returns (T,H,W,C) or (T,C,H,W) for PVG.
+        """        
 
-        # If dataset was generated as a video, read frames from the session video
-        if output_mode == "video":
-            # Derive session directory from the formatted frame path (which points to .../frames/{:06d}.jpg)
-
-            video_fpath = Path(fpath)
-
-            cap = cv2.VideoCapture(str(video_fpath))
-            if not cap.isOpened():
-                raise ValueError(f"Could not open video file: {video_fpath}")
-
-            frames_list = []
-            for frame_id in frame_ids:
-                # Seek to the exact frame index (keyframe every frame in our generator)
-                cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_id))
-                ret, frame = cap.read()
-                if not ret or frame is None:
-                    cap.release()
-                    raise ValueError(
-                        f"Could not read frame {frame_id} from video {video_fpath}."
-                    )
-
-                frame = cv2.resize(
-                    frame,
-                    (
-                        int(frame.shape[1] * scaling_factor),
-                        int(frame.shape[0] * scaling_factor),
-                    ),
-                    interpolation=cv2.INTER_AREA,
-                )
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.uint8)
-
-                if self.occlusion_mask is not None:
-                    frame = (
-                        frame * (1 - self.occlusion_mask) + self.occlusion_mask * 128
-                    )
-
-                if transform is not None:
-                    frame = transform(frame)
-                frames_list.append(frame)
-
-            cap.release()
-            frames = np.stack(frames_list, axis=0)
-            if self.format == DatasetOutputFormat.PVG:
-                frames = frames.transpose(0, 3, 1, 2)
-            return frames
-
-        # Default path: read from per-frame images
         def worker(frame_id, frame_fpath, scaling_factor=1, transform=None):
             """Read a single frame from a file."""
+            # frame_id += 1 #TODO: fix frame_id+1
             frame = cv2.imread(str(frame_fpath).format(frame_id))
             if frame is None:
                 raise ValueError(
@@ -840,7 +902,7 @@ class EnvironmentDataset(Dataset):
                     (
                         frame_id,
                         (
-                            fpath
+                            frame_fpath
                             if frame_id != 0 or start_frame_fpath is None
                             else start_frame_fpath
                         ),
@@ -857,26 +919,22 @@ class EnvironmentDataset(Dataset):
         return frames
 
     def __getitem__(self, idx):
-        if self.total_windows == 0:
-            raise IndexError("Empty dataset after indexing")
+        # update data if seq_length_variable has changed, use locking
+        if self.seq_length_variable != self.seq_length_current:
+            with self.lock:
+                if self.seq_length_variable != self.seq_length_current:
+                    unique_str = (
+                        f"{self.fsl.version}_{self.seq_length_input}_{self.seq_step}"
+                    )
+                    self.data = self.__create_data(self.seq_length_variable)
+                    if idx >= len(self.data):
+                        idx = idx % len(self.data)
 
-        if self.total_windows <= idx:
-            raise IndexError(
-                f"Index {idx} out of range for dataset of size {self.total_windows}"
-            )
-
-        # idx = idx % self.total_windows
-        sess_idx = int(np.searchsorted(self.cum_windows, idx + 1, side="left"))
-        prev = 0 if sess_idx == 0 else int(self.cum_windows[sess_idx - 1])
-        k = idx - prev
-        sess = self.sessions_info[sess_idx]
-        instance_id = sess["instance_id"]
-        session_id = sess["session_id"]
-        seq_start = sess["first_start"] + k * self.seq_step
-        group = sess["group"]
-        seq_metadata_entry = group.iloc[
-            seq_start : seq_start + self.seq_length_current, :
-        ]
+        entry = self.data[idx]
+        i = entry["seq_start"]
+        seq_metadata_entry = entry["group"].iloc[i : i + self.seq_length_current, :]
+        instance_id = entry["env_instance_id"]
+        session_id = entry["env_session_id"]
         src_frame_ids = seq_metadata_entry["src_frame_id"].tolist()[
             : self.seq_length_current
         ]
@@ -886,35 +944,19 @@ class EnvironmentDataset(Dataset):
         actions = seq_metadata_entry["action"].to_list()[: self.seq_length_current]
 
         start_frame_fpath = self.fsl[instance_id].start_frame_fpath
-        if self.output_mode == "frame":
-            frame_fpath = self.fsl[instance_id].get_frame_fpath(
-                session_id=session_id, session_props=None, frame_id=None
-            )
+        frame_fpath = self.fsl[instance_id].get_frame_fpath(
+            session_id=session_id, session_props=None, frame_id=None
+        )
 
-            frames = self._read_frames(
-                frame_fpath,
-                start_frame_fpath,
-                src_frame_ids + [tgt_frame_id],
-                scaling_factor=1,
-                transform=(
-                    self.transform if self.format != DatasetOutputFormat.PVG else None
-                ),
-                output_mode=self.output_mode,
-            )
-        elif self.output_mode == "video":
-            video_fpath = self.fsl[instance_id].get_video_fpath(
-                session_id=session_id, session_props=None
-            )
-            frames = self._read_frames(
-                video_fpath,
-                start_frame_fpath,
-                src_frame_ids + [tgt_frame_id],
-                scaling_factor=1,
-                transform=(
-                    self.transform if self.format != DatasetOutputFormat.PVG else None
-                ),
-                output_mode=self.output_mode,
-            )
+        frames = self._read_frames(
+            frame_fpath,
+            start_frame_fpath,
+            src_frame_ids + [tgt_frame_id],
+            scaling_factor=1,
+            transform=(
+                self.transform if self.format != DatasetOutputFormat.PVG else None
+            ),
+        )
 
         # frames = self.jitter_transform(torch.tensor(frames, dtype=torch.float32)).numpy()
 
@@ -923,7 +965,7 @@ class EnvironmentDataset(Dataset):
 
         actions = np.array([action for action in actions], dtype=np.uint8)
         if self.format == DatasetOutputFormat.IVG:
-            is_first = np.zeros((self.seq_length_current + 1, 1), dtype=int)
+            is_first = np.zeros((self.seq_length_variable + 1, 1), dtype=int)
             is_first[0, :] = np.ones_like(is_first[0, :])
             if np.array(self.info["info"]["action_space"])[-1] > 1:
                 if (
@@ -1003,10 +1045,12 @@ class EnvironmentDataset(Dataset):
         return output
 
     def __len__(self):
-        size = self.total_windows if hasattr(self, "total_windows") else 0
-        if self.max_size is not None and size > self.max_size:
-            size = self.max_size
-        return size
+        if self.max_size is not None and self.max_size < len(self.data):
+            return self.max_size
+        return len(self.data)
+
+    def set_observations_count(self, observations_count):
+        self.seq_length_variable = observations_count
 
     def sample_actions(self, forbidden_actions):
         actions = torch.zeros_like(forbidden_actions)
@@ -1022,8 +1066,13 @@ class EnvironmentDataset(Dataset):
 
         return actions
 
+# -----------------------------------------------------------------------------
+# Transforms generator
+# ----------------------------------------------------------------------------
 
 class TransformsGenerator:
+    """Factory for consistent resize/crop + (optional) color jitter + ToTensor."""
+
     @staticmethod
     def color_jitter_transform(
         image: np.ndarray, brightness: int, contrast: int, saturation: int, hue: int
@@ -1094,6 +1143,9 @@ class TransformsGenerator:
 
     @staticmethod
     def pad_to_match_aspect_ratio(image: np.ndarray, target_size: Tuple[int, int]):
+        """
+        Zero-pad an image to match `target_size` aspect ratio (without scaling).
+        """        
         height, width = image.shape[:2]
         target_width, target_height = target_size
 
@@ -1161,6 +1213,9 @@ class TransformsGenerator:
 
     @staticmethod
     def get_evaluation_transforms_config(config) -> Tuple:
+        """
+        Convenience: build train/val/test transforms from config fields.
+        """        
         return TransformsGenerator.get_evaluation_transforms(
             config.data.crop, config.observation_space[config.enc_cnn_keys[0]]
         )
@@ -1261,8 +1316,13 @@ class TransformsGenerator:
             "test": transform,
         }
 
+# -----------------------------------------------------------------------------
+# Quick visual tester
+# -----------------------------------------------------------------------------
 
 class EnvironmentDatasetTester:
+    """Utility to visualize dataset samples as stitched PNGs for sanity checks."""
+
     def __init__(self, dataset: EnvironmentDataset, ouput_dpath):
         self.dataset = dataset
         self.output_dpath = ouput_dpath
@@ -1271,6 +1331,9 @@ class EnvironmentDatasetTester:
             f.unlink()
 
     def visualize(self, idx):
+        """
+        Save a side-by-side PNG of input frames (with action captions) and target frame.
+        """        
         data = self.dataset[idx]
         input_frames = list(data["input_frames"])
         for i in range(len(input_frames)):

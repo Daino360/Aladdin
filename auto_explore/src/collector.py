@@ -1,3 +1,21 @@
+"""
+collector.py: runs environments to gather experience and write episodes to a dataset.
+
+- Drives one or more envs with an AutoExploreAgent, using epsilon-greedy exploration
+  (epsilon decays linearly to a floor by epoch 300).
+- Converts observations (HWC) to NCHW for the agent, turns chosen action IDs into
+  one-hot vectors for env.step().
+- Optionally computes intrinsic rewards from a world model:
+    * 'entropy'  – token-logit entropy of predicted frames,
+    * 'cnn-mse'  – feature-space MSE via a frozen SmallConvNet,
+    * 'vae-mse'  – latent-space MSE via a VanillaVAE trained online.
+- Buffers observations/actions/rewards/dones and packs them into Episode objects,
+  creating or appending in EpisodesDataset (with a per-env one-hot 'condition').
+- Handles vectorized env resets, tracks steps/episodes, and restores agent train/eval state.
+- Saves an animated GIF per episode and (optionally) logs GIFs, metrics, and histograms to Weights & Biases.
+- Includes small helpers for per-frame processing and GIF writing.
+"""
+
 import os
 import random
 import sys

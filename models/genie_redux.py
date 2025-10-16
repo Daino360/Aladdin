@@ -1,3 +1,29 @@
+"""
+genie_redux.py — High-level video generation models that wrap a tokenizer and a dynamics model.
+----------------------
+- Defines two neural modules:
+
+  1) GenieReduxGuided:
+     - Uses a *frozen* video tokenizer to turn frames into discrete codebook indices.
+     - Uses a *guided* Dynamics module (MaskGIT-based) that conditions on **actions**.
+     - Can generate future frames by iterative masked-token sampling.
+     - Provides training forward passes, optional extra decoder loss, and metrics logging.
+
+  2) GenieRedux (unguided variant):
+     - Adds a LatentActionModel (LAM) that predicts *latent* action codes directly
+       from the input video, then feeds those into an *unguided* Dynamics model.
+     - Otherwise mirrors GenieReduxGuided in structure and training flow.
+
+- Utilities included:
+  - Small helper functions (exists, default, etc.).
+  - An eval decorator to temporarily switch modules to eval mode for sampling.
+
+In short: these classes are the orchestration layer that connects a tokenizer
+(discretizes frames), a dynamics model (predicts next tokens), and optionally an
+action-embedding path (real actions or latent actions). They expose convenient
+APIs for training, sampling, and evaluation.
+"""
+
 import functools
 import torch
 import torch.nn.functional as F
@@ -8,31 +34,42 @@ from einops import rearrange, repeat
 from models.dynamics import Dynamics
 from models.tokenizer import Tokenizer
 from models.lam import LatentActionModel
-# helpers
+
+# ----------------------------- #
+# Helper functions (tiny utils) #
+# ----------------------------- #
 
 def exists(val):
+    """Return True if a value is not None."""
     return val is not None
 
 
 def default(val, d):
+    """Return val if it exists, otherwise the provided default d."""
     return val if exists(val) else d
 
 
 def cast_tuple(val, length=1):
+    """Ensure val is a tuple of a given length by repeating as necessary."""
     return val if isinstance(val, tuple) else (val,) * length
 
 
 def reduce_mult(arr):
+    """Multiply all elements of an iterable together."""
     return functools.reduce(lambda x, y: x * y, arr)
 
 
 def pair(val):
+    """Force a scalar or one value into a 2-tuple (h, w)."""
     ret = (val, val) if not isinstance(val, tuple) else val
     assert len(ret) == 2
     return ret
 
-
 def eval_decorator(fn):
+    """
+    Decorator that runs a method with the module set to eval() and restores
+    the previous training state afterwards (useful for deterministic sampling).
+    """    
     def inner(model, *args, **kwargs):
         was_training = model.training
         model.eval()
@@ -42,8 +79,18 @@ def eval_decorator(fn):
     
     return inner
 
+# ================================== #
+# Guided model: actions are provided #
+# ================================== #
 
 class GenieReduxGuided(nn.Module):
+    """
+    A guided video generator:
+      - Freezes the Tokenizer (discrete VQ-like encoder/decoder).
+      - Uses Dynamics (MaskGIT) that conditions on actions.
+      - Exposes sampling, interactive rollout, and training with optional
+        decoder reconstruction loss on top of dynamics logits.
+    """    
     def __init__(
         self,
         tokenizer: Tokenizer,
@@ -55,6 +102,7 @@ class GenieReduxGuided(nn.Module):
         #     assert dynamics.maskgit.is_guided, "Dynamics must be guided"
         super().__init__()
 
+        # Freeze tokenizer: used only to encode frames to tokens and decode tokens to frames
         self.tokenizer = tokenizer
         self.tokenizer.eval()
         for param in self.tokenizer.parameters():
@@ -64,8 +112,9 @@ class GenieReduxGuided(nn.Module):
 
         self.image_size = tokenizer.image_size
 
-        self.dim_actions = dynamics.maskgit.action_dim
+        self.dim_actions = dynamics.maskgit.action_dim # action classes for guided dynamics
 
+        # Store lightweight config for reproducibility/debugging
         config = {}
         arguments = locals()
         for key in arguments.keys():
@@ -80,6 +129,7 @@ class GenieReduxGuided(nn.Module):
                 config[key] = arguments[key]
         self.config = config
 
+        # Optionally learn action embeddings instead of one-hot
         self.use_action_embeddings = False
         if "use_action_embeddings" in kwargs:
             self.use_action_embeddings = kwargs["use_action_embeddings"]
@@ -90,25 +140,34 @@ class GenieReduxGuided(nn.Module):
             self.action_embeddings = nn.Embedding(
                 num_embeddings=self.dim_actions, embedding_dim=dynamics.maskgit.dim
             )
-            
+        
+        # (Optional) precomputed codebook distance matrix (unused by default here)            
         self.vq_codebook_distances = None
 
     @property
     def patch_height_width(self):
+        """Convenience: (Hp, Wp) number of patches per frame from the tokenizer."""
         return self.tokenizer.patch_height_width
 
     def trainable_parameters(self):
+        """Return parameters to optimize (tokenizer is frozen → only dynamics)."""
         trainable_parameters = list(self.dynamics.parameters())
         return trainable_parameters
 
     def state_dict(self, *args, **kwargs):
+        """Save only the dynamics weights (tokenizer is external/frozen)."""
         state_dict = {"dynamics": self.dynamics.state_dict(*args, **kwargs)}
         return state_dict
 
     def load_state_dict(self, state_dict, strict=True, *args, **kwargs):
+        """Load only the dynamics weights."""
         self.dynamics.load_state_dict(state_dict["dynamics"], strict=strict, *args, **kwargs)
 
     def accelator_log(self, accelerator_tracker_dict, ce_loss, decoder_loss=None):
+        """
+        Lightweight metric logging helper (Cross-Entropy + optional Decoder loss)
+        using an accelerator tracker if provided.
+        """        
         if exists(accelerator_tracker_dict):
             train = accelerator_tracker_dict["train"]
             tracker = accelerator_tracker_dict["tracker"]
@@ -134,20 +193,39 @@ class GenieReduxGuided(nn.Module):
                     step=step,
                 )
 
+
+    # ----------------------- #
+    # Tokenizer convenience   #
+    # ----------------------- #
+
     def get_tokenizer_codebook_ids(self, videos):
+        """Encode frames to discrete codebook indices with the frozen tokenizer."""
         return self.tokenizer(videos, return_only_codebook_ids=True)
 
     def num_tokens_per_frames(self, num_frames, num_first_frames):
+        """Return how many tokens correspond to the requested number of frames."""
         return self.tokenizer.num_tokens_per_frames(num_frames, num_first_frames)
 
     def get_video_patch_shape(self, num_frames, num_first_frames):
+        """Return (T,H,W) token grid shape for a given (prime + generated) span."""
         return self.tokenizer.get_video_patch_shape(num_frames, num_first_frames)
 
     def decode_from_codebook_indices(self, codebook_indices):
+        """Decode a full sequence of token indices back into frames."""
         return self.tokenizer.decode_from_codebook_indices(codebook_indices)
+
+
+    # ----------------------- #
+    # Action encoding helpers #
+    # ----------------------- #
 
     def get_codes_from_indices(self, indices):
         # convert the indices to action one hot vectors
+        """
+        Turn integer action indices into model-consumable codes:
+          - if use_action_embeddings=True → learned embeddings
+          - else → one-hot vectors
+        """
         if self.use_action_embeddings:
             return self.action_embeddings(indices)
         else:
@@ -169,15 +247,26 @@ class GenieReduxGuided(nn.Module):
         *args,
         **kwargs,
     ):
+        """
+        Generate 'num_frames' future frames conditioned on 'prime_frames' and 'actions'
+        using MaskGIT-like iterative masked sampling in Dynamics.
+
+        Returns:
+          - decoded video (B,C,T,H,W) by default
+          - optionally: token ids, confidence maps per step, or raw logits
+        """        
         assert prime_frames is not None, "Prime frames should be provided"
         assert actions is not None, "Actions should be provided"
         assert num_frames is not None, "Number of frames to generate should be provided"
 
         # derive the priming token ids, to be prepended to the input being demasked by mask-git at each round
+        # 1) Tokenize primes
         prime_token_ids = self.get_tokenizer_codebook_ids(prime_frames)
         prime_token_ids = rearrange(prime_token_ids, "b ... -> b (...)")
 
         prime_num_frames = prime_frames.shape[2]
+        
+        # 2) Determine target token span & shapes
         num_tokens = self.num_tokens_per_frames(
             num_frames, num_first_frames=prime_num_frames
         )
@@ -186,8 +275,10 @@ class GenieReduxGuided(nn.Module):
         )
 
         # derive the latent actions
+        # 3) Prepare action codes
         actions = self.get_codes_from_indices(actions)
 
+        # 4) Dynamics sampling (returns future tokens only)
         output = self.dynamics.sample(
             prime_token_ids=prime_token_ids,
             actions=actions,
@@ -204,8 +295,9 @@ class GenieReduxGuided(nn.Module):
 
         if return_logits:
             logits = output
-            return logits
+            return logits #raw logits
 
+        # Merge prime + generated tokens and optionally return ids
         if return_confidence:
             video_token_ids, confidence = output
         else:
@@ -219,7 +311,8 @@ class GenieReduxGuided(nn.Module):
                 return video_token_ids, confidence
             else:
                 return video_token_ids
-
+            
+        # 5) Decode to frames and drop the priming window
         video = self.decode_from_codebook_indices(video_token_ids)
 
         video = video[:, :, prime_num_frames:]
@@ -244,10 +337,21 @@ class GenieReduxGuided(nn.Module):
         *args,
         **kwargs,
     ):
+        """
+        Rolling-window generation:
+          - Repeatedly generate 'dream_length' steps ahead using a sliding window
+            over the already generated tokens.
+          - Useful for interactive or long-horizon generation where you keep
+            extending a trajectory.
+
+        Returns:
+          decoded video; optionally confidence/logits if requested.
+        """        
         assert prime_frames is not None, "Prime frames should be provided"
         assert actions is not None, "Actions should be provided"
         assert num_frames is not None, "Number of frames to generate should be provided"
 
+        # Tokenize primes once
         prime_token_ids = self.get_tokenizer_codebook_ids(prime_frames)
 
         # Extend actions to cover dream length
@@ -258,8 +362,8 @@ class GenieReduxGuided(nn.Module):
         initial_prime_num_frames = prime_frames.shape[2]
 
         video_tokens = prime_token_ids
-        full_confidence = None
-
+        full_confidence = None # accumulate confidence per sampling step if requested
+ 
         for i in range(0,num_frames,dream_length):
             # Calculate window start and end frames
             start_frame = 0 # max(0, i + initial_prime_num_frames - window_size)
@@ -303,6 +407,7 @@ class GenieReduxGuided(nn.Module):
                 if full_logits is None:
                     full_logits = logits
                 else:
+                    # Concatenate confidence time-wise
                     for ind, item in enumerate(logits):
                         item = rearrange(item, "b (t h w) -> b t h w", h=patch_shape[1], w=patch_shape[2])
                         full_item = rearrange(full_logits[ind], "b (t h w) -> b t h w", h=patch_shape[1], w=patch_shape[2])
@@ -348,7 +453,19 @@ class GenieReduxGuided(nn.Module):
         
         return video
     
+
+    # ----------------------- #
+    # Optional decoder loss   #
+    # ----------------------- #
+
     def decoder_loss(self, logits, videos):
+        """
+        Extra reconstruction loss from dynamics logits:
+          - Convert logits → soft distribution over codebook entries.
+          - Take convex combination of codebook to produce token features.
+          - Use STE to snap to nearest codebook entry and pass through tokenizer decoder.
+          - MSE against ground-truth frames.
+        """
         # compute the logit softmax
         logit_softmax = F.softmax(logits, dim=-1)
         
@@ -389,6 +506,11 @@ class GenieReduxGuided(nn.Module):
         
         return recons_loss
 
+
+    # ----------------------- #
+    # Training forward passes #
+    # ----------------------- #
+
     def forward(
         self,
         videos=None,
@@ -402,6 +524,14 @@ class GenieReduxGuided(nn.Module):
         **kwargs,
     ):
 
+        """
+        Training step:
+          1) Encode frames to token ids (no grad).
+          2) (Optionally) embed actions.
+          3) Run dynamics loss (CE / focal / etc.).
+          4) (Optional) add decoder MSE loss computed from dynamics logits.
+        """
+
         assert exists(videos) and exists(actions), "videos and actions must be provided"
 
         with torch.no_grad():
@@ -409,6 +539,7 @@ class GenieReduxGuided(nn.Module):
 
         video_codebook_ids = video_codebook_ids.detach()
 
+        # If using learned action embeddings, convert one-hot -> indices -> embeddings
         if self.use_action_embeddings:
             #turn actions from one hot encoding on the last dim to indices
             actions = torch.argmax(actions, dim=-1)
@@ -424,14 +555,17 @@ class GenieReduxGuided(nn.Module):
             tokenizer=self.tokenizer,
         )
         
+        # If caller wants raw logits, return directly
         if return_logits:
             return dynamics_output
         
+        # Standard CE-only training
         if not use_decoder_loss:
             loss = dynamics_output
             self.accelator_log(accelerator_tracker_dict, loss)
             return loss
         
+        # CE + decoder reconstruction
         ce_loss, logits = dynamics_output
         
         decoder_loss = self.decoder_loss(logits, videos[:, :, 1:])
@@ -443,7 +577,16 @@ class GenieReduxGuided(nn.Module):
         return loss
 
 
+# ==================================================== #
+# Unguided model: latent actions predicted from video  #
+# ==================================================== #
+
 class GenieRedux(GenieReduxGuided):
+    """
+    Unguided variant:
+      - Uses a LatentActionModel to infer action codes from the video.
+      - Dynamics must be instantiated as *unguided* (no explicit action concat).
+    """    
     def __init__(
         self,
         tokenizer: Tokenizer,
@@ -459,26 +602,34 @@ class GenieRedux(GenieReduxGuided):
         )
 
         self.latent_action_model = latent_action_model
-
+        
+        # Remove large objects from the stored config to keep it lightweight
         if "latent_action_model" in self.config:
             del self.config["latent_action_model"]
 
     def trainable_parameters(self):
+        """Optimize both the dynamics and the latent action model."""
         trainable_parameters = super().trainable_parameters()
         trainable_parameters += list(self.latent_action_model.parameters())
         return trainable_parameters
     
     def state_dict(self, *args, **kwargs):
+        """Save both dynamics and LAM weights."""
         state_dict = {}
         state_dict["dynamics"] = self.dynamics.state_dict()
         state_dict["latent_action_model"] = self.latent_action_model.state_dict()
         return state_dict
     
     def load_state_dict(self, state_dict, *args, **kwargs):
+        """Load both dynamics and LAM weights (LAM load is non-strict by default)."""
         self.dynamics.load_state_dict(state_dict["dynamics"], *args, **kwargs)
         self.latent_action_model.load_state_dict(state_dict["latent_action_model"], strict=False, *args, **kwargs)
 
     def get_codes_from_indices(self, indices):
+        """
+        Convert integer action indices to latent action embeddings via LAM,
+        then tile them across (H,W) to match video token grid.
+        """        
         h, w = self.patch_height_width
         actions = self.latent_action_model.get_codes_from_indices(indices)
         actions = repeat(actions, "b t d -> b t h w d", h=h, w=w)
@@ -496,6 +647,13 @@ class GenieRedux(GenieReduxGuided):
         *args,
         **kwargs,
     ):
+        """
+        Training forward (unguided):
+          - Tokenize video to codebook ids (no grad).
+          - Get latent actions from LAM.
+          - Train dynamics on (tokens, latent actions).
+          - Optionally add decoder reconstruction loss.
+        """        
 
         with torch.no_grad():
             video_codebook_ids = self.tokenizer(videos, return_only_codebook_ids=True)

@@ -1,3 +1,22 @@
+"""
+evaluation.py — Unified evaluators for video generation quality
+------------------------------------
+It provides a small set of evaluators you can plug into your video–generation
+experiments:
+
+• FIDEvaluator        → computes Fréchet Inception Distance (FID) on videos
+• FidelityEvaluator   → computes fidelity metrics: PSNR and SSIM
+• ControlabilityEvaluator → measures action sensitivity via ΔPSNR
+• Evaluator           → a convenience wrapper that combines the above
+
+Notes
+-----
+• Videos are expected in BCHWT (batch, channels, time, height, width).
+• For FID we flatten time into the batch dimension and (optionally) resize
+  frames to 299×299 before updating the metric state.
+• You can optionally use Inception-V3 features for FID (`fid_iv3=True`).
+"""
+
 from einops import rearrange
 import torch
 from quality_metrics.fid import FrechetInceptionDistance
@@ -12,6 +31,9 @@ from torchvision.models import inception_v3, Inception_V3_Weights
 class FIDEvaluator:
     """
     Evaluator for Fréchet Inception Distance (FID) metric.
+    
+    Tracks feature statistics for real and generated frames and computes the
+    Fréchet distance between their Gaussians. Time is collapsed into the batch.    
     """
 
     def __init__(self, device, fid_iv3=False) -> None:
