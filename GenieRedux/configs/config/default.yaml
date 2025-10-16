@@ -28,6 +28,8 @@ train:
   save_model_every: 1000
   resume_ckpt: "no"
   save_root_dpath: "./checkpoints"
+  enable_cache: True
+  cache_dpath: "cache/${train.dataset_name}/"
   wandb_dpath: "./logs/wandb"
   wandb_mode: "online"
   wandb_project: "GenieRedux"
@@ -45,7 +47,8 @@ eval:
   batch_size: 6
   n_data_workers: 8
   n_envs: 0
-  enable_cache: false
+  enable_cache: False
+  cache_dpath: "cache/${eval.dataset_name}/"
   num_actions: 5
   num_frames: 16
   seq_step: 16

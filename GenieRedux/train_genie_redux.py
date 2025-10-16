@@ -111,8 +111,8 @@ def run(args):
             split="train",
             transform=transforms["train"],
             format=DatasetOutputFormat.IVG,
-            enable_cache=False,
-            # cache_dpath=f"{cache_dir}/cache/{dataset_name}",
+            enable_cache=args.train.enable_cache,
+            cache_dpath=args.train.cache_dpath,,
             n_workers=n_workers,
             n_envs=n_envs,
         )
@@ -125,8 +125,8 @@ def run(args):
             split="train",
             transform=transforms["train"],
             format=DatasetOutputFormat.IVG,
-            enable_cache=True,
-            # cache_dpath=f"{cache_dpath}/cache/{args.train.dataset_name}",
+            enable_cache=args.train.enable_cache,
+            cache_dpath=args.train.cache_dpath, # Forse non va messo
         )
 
         # n_samples_valid = math.ceil(n_total_samples / train_ds_mev.n_datasets) #ADDEDBYME
@@ -140,11 +140,12 @@ def run(args):
             split="validation",
             transform=transforms["train"],
             format=DatasetOutputFormat.IVG,
-            enable_cache=False,
-            # cache_dpath=f"{cache_dir}/cache/{args.dataset}",
+            enable_cache=args.train.enable_cache,
+            cache_dpath=args.train.cache_dpath,
             n_workers=n_workers,
             n_envs=n_envs,
             n_samples=n_samples_valid,
+            source_dataset=train_ds_mev,
         )
         """
         valid_ds_mev = EnvironmentDataset( #ADDEDBYME ho aggiunto _mev in entrambi i ds
@@ -155,8 +156,9 @@ def run(args):
             split="validation",
             transform=transforms["train"],
             format=DatasetOutputFormat.IVG,
-            enable_cache=True,
-            # cache_dpath=f"{cache_dpath}/cache/{args.train.dataset_name}",
+            enable_cache=args.train.enable_cache,
+            cache_dpath=args.train.cache_dpath,
+            source_dataset=train_ds_mev,
         )
         
         valid_ds_mev = Subset(valid_ds_mev, range(n_total_samples))

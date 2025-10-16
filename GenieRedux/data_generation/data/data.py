@@ -214,6 +214,26 @@ class DatasetFileStructureInstance(DatasetFileStructure):
         fpath = dpath / fname
         return str(fpath)
 
+    def get_video_fpath(self, session_id, session_props):
+        """
+        Returns the file path for a video in an instance.
+
+        Parameters:
+        - session_id (str): The ID of the session.
+
+        Returns:
+        - str: The file path of the video.
+        """
+
+        session_id_label = self.session_id_format.format(session_id)
+        fpath: Path = self.replace(
+            self.video_fmtdpath,
+            self.SESSION_ID,
+            session_id_label,
+        )  # type: ignore
+
+        return str(fpath)        
+
     def get_session_ids(self) -> list[int]:
         """
         Returns a list of session IDs contained in the instance directory.

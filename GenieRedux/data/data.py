@@ -22,7 +22,7 @@ import random
 from multiprocessing import Lock, cpu_count
 from multiprocessing.pool import ThreadPool
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -295,6 +295,7 @@ class MultiEnvironmentDataset(Dataset):
         enable_cache: bool = True,
         cache_dpath: str = "cache",
         occlusion_mask: np.ndarray | None = None,
+        source_dataset: Optional["MultiEnvironmentDataset"] = None,
         n_workers: int = 46,
         n_envs: int = 0,
         whitelist: list[str] = None,
@@ -367,9 +368,21 @@ class MultiEnvironmentDataset(Dataset):
 
         # paths = paths[-200:]
 
+        # Optional: reuse per-environment metadata from an existing MultiEnvironmentDataset
+        self.env_dataset_lookup = None
+        if source_dataset is not None:
+            self.env_dataset_lookup = {}
+            for ds in source_dataset.datasets:
+                base = ds.dataset if isinstance(ds, Subset) else ds
+                env_root = str(base.fsl.fs.root_dpath)
+                self.env_dataset_lookup[env_root] = base
+
         def create_environment_dataset(path, id):
             self.log.d(f"Creating dataset {id} from {path}")
             try:
+                source_dataset = None
+                if self.env_dataset_lookup is not None:
+                    source_dataset = self.env_dataset_lookup[str(path)]
                 dataset = EnvironmentDataset(
                     root_dpath=path,
                     seq_length_input=seq_length_input,
@@ -386,6 +399,7 @@ class MultiEnvironmentDataset(Dataset):
                     enable_cache=enable_cache,
                     cache_dpath=cache_dpath,
                     occlusion_mask=occlusion_mask,
+                    source_dataset=source_dataset,
                 )
             except KeyError as e:
                 self.log.e(f"KeyError loading dataset from {path}: {e}")
@@ -487,6 +501,7 @@ class EnvironmentDataset(Dataset):
         enable_cache: bool = True,
         cache_dpath: str = "cache",
         occlusion_mask: np.ndarray | None = None,
+        source_dataset: Optional["EnvironmentDataset"] | None = None,
     ) -> None:
         """
         Initializes the Data class.
@@ -505,7 +520,7 @@ class EnvironmentDataset(Dataset):
         """
 
         self.seq_length_input = seq_length_input
-        self.seq_length_variable = seq_length_input
+        self.seq_length_current = seq_length_input
         self.seq_step = seq_step
         self.enable_test = enable_test
         self.format = format
@@ -534,11 +549,23 @@ class EnvironmentDataset(Dataset):
         )
         self.actions_shape = self.info["action_space"]
 
-        self.fsl = DatasetFileStructureSessionLibrary(
-            root_dpath, version=Version(self.info["version"]), extension=img_ext
-        )
+        # Determine output mode from generator config (frame vs video). Default to frames.
+        self.output_mode = str(self.info["generator_config"]["output_mode"]).lower()
+
+        # Reuse file structure library from a base dataset if it points to the same root
+        if source_dataset is not None:
+            assert str(source_dataset.fsl.fs.root_dpath) == str(Path(root_dpath))
+            self.fsl = source_dataset.fsl
+        else:
+            self.fsl = DatasetFileStructureSessionLibrary(
+                root_dpath, version=Version(self.info["version"]), extension=img_ext
+            )
+
         self.lock = Lock()
         self.data = {}
+
+        # Ensure attribute exists before first use in __getitem__
+        self.n_actions = None
 
         # Set up cache
         self.enable_cache = enable_cache
@@ -548,25 +575,60 @@ class EnvironmentDataset(Dataset):
             self.cache_metadata_fpath = (
                 self.cache_dpath / f"metadata_{self.name}_{self.fsl.version}.feather"
             )
-            if self.clip_length > 0:
-                self.cache_data_seq_fpath = (
-                    self.cache_dpath
-                    / f"dataseq_{self.split_type}_{self.__DATASET_SPLIT[self.split][0]}_{self.__DATASET_SPLIT[self.split][1]}_{self.name}_{self.fsl.version}_{self.seq_length_variable}_{self.seq_step}_{self.clip_length}.feather"
-                )
-            else:
-                self.cache_data_seq_fpath = (
-                    self.cache_dpath
-                    / f"dataseq_{self.split_type}_{self.__DATASET_SPLIT[self.split][0]}_{self.__DATASET_SPLIT[self.split][1]}_{self.name}_{self.fsl.version}_{self.seq_length_variable}_{self.seq_step}.feather"
-                )
+        # Keep a reference to base metadata to enable split views and reuse.
+        if source_dataset is not None and hasattr(source_dataset, "metadata_base"):
+            self.metadata_base = source_dataset.metadata_base
+        elif source_dataset is not None and hasattr(source_dataset, "metadata_full"):
+            # Backward-compat for any code still using metadata_full
+            self.metadata_base = source_dataset.metadata_base
+        else:
+            self.metadata_base = self.__create_metadata()
 
-        self.metadata = self.__create_metadata()
+        self.metadata = self.__build_split(self.metadata_base, split, split_type)
         self.n_instances = len(list(self.metadata.keys()))
         self.max_size = max_size
-        self.split = split
-        self.split_type = split_type
+        self.sessions_info = self._build_sessions_from_metadata()
+        self._recompute_window_index()
 
-        self.metadata = self.__build_split(self.metadata, split, split_type)
-        self.data = self.__create_data(self.seq_length_variable)
+    def _build_sessions_from_metadata(self):
+        sessions_info = []
+        for inst_id, df in self.metadata.items():
+            for sess_id, group in df.groupby("session_id"):
+                first_start = 0 if self.fsl.fs.start_frame_fpath is None else 1
+                sessions_info.append(
+                    {
+                        "instance_id": inst_id,
+                        "session_id": int(sess_id),
+                        "group": group.reset_index(drop=True),
+                        "first_start": first_start,
+                    }
+                )
+        return sessions_info
+
+    def _recompute_window_index(self):
+        seq_len = self.seq_length_current
+        n_per = []
+        for sess in self.sessions_info:
+            group = sess["group"]
+            first = sess["first_start"]
+            L = (
+                min(len(group), self.clip_length)
+                if self.clip_length > 0
+                else len(group)
+            )
+            last_exclusive = L - seq_len
+            if last_exclusive <= first - 1:
+                n = 0
+            else:
+                n = math.ceil((last_exclusive - first) / self.seq_step)
+            n_per.append(max(0, n))
+        self.n_windows_per_session = n_per
+        self.cum_windows = (
+            np.cumsum(self.n_windows_per_session) if n_per else np.array([], dtype=int)
+        )
+        self.total_windows = (
+            int(self.cum_windows[-1]) if len(self.cum_windows) > 0 else 0
+        )
 
     @staticmethod
     def __read_info(info_fpath):
@@ -619,12 +681,11 @@ class EnvironmentDataset(Dataset):
                 int(math.floor(n_elements * self.__DATASET_SPLIT[split][1])),
             )
 
-            metadata = {id: metadata[id] for id in dataset_split}
+            new_metadata = {id: metadata[id] for id in dataset_split}
         elif split_type == "session":
+            new_metadata = {}
             for i in range(n_elements):
-                # get all unique values of session_id in the dataframe metadata[i]
                 session_ids = sorted(list(metadata[i]["session_id"].unique()))
-
                 session_ids = session_ids[
                     int(
                         math.floor(len(session_ids) * self.__DATASET_SPLIT[split][0])
@@ -632,11 +693,13 @@ class EnvironmentDataset(Dataset):
                         math.floor(len(session_ids) * self.__DATASET_SPLIT[split][1])
                     )
                 ]
-                # select only those elements of metadata[i] which elements are in session_ids
-                metadata[i] = metadata[i][metadata[i]["session_id"].isin(session_ids)]
+                new_metadata[i] = metadata[i][
+                    metadata[i]["session_id"].isin(session_ids)
+                ]
         elif split_type == "frame":
+            new_metadata = {}
             for i in range(n_elements):
-                metadata[i] = metadata[i].iloc[
+                new_metadata[i] = metadata[i].iloc[
                     int(
                         math.floor(
                             len(metadata[i].index) * self.__DATASET_SPLIT[split][0]
@@ -650,15 +713,9 @@ class EnvironmentDataset(Dataset):
 
         else:
             raise ValueError(f"Invalid split type: {split_type}")
-
-        # #assert that the intervals in dataset_split are not intersecting
-        # for split1 in dataset_split:
-        #     for split2 in dataset_split:
-        #         if split1 != split2:
-        #             assert len(set(dataset_split[split1]).intersection(set(dataset_split[split2]))) == 0
-
-        return metadata
-
+        
+        return new_metadata
+    
     def __create_metadata(self):
         """
         Build a dict: {instance_id: DataFrame(src_frame_id, tgt_frame_id, action, session_id, ...)}.
@@ -676,23 +733,11 @@ class EnvironmentDataset(Dataset):
                             metadata_from_file["instance_id"] == instance_id
                         ]
 
-                except EOFError:
+                except (EOFError, OSError, Exception) as e:
                     self.log.e(
-                        f"EOFError loading metadata from cache: {self.cache_metadata_fpath}"
+                        f"Error loading metadata from cache: {self.cache_metadata_fpath} ({type(e).__name__}: {e})"
                     )
                     has_read_error = True
-                except OSError:
-                    self.log.e(
-                        f"OSError loading metadata from cache: {self.cache_metadata_fpath}"
-                    )
-                    has_read_error = True
-                except Exception:
-                    self.log.e(
-                        f"Error loading metadata from cache: {self.cache_metadata_fpath}"
-                    )
-                    has_read_error = True
-                finally:
-                    pass
         if (
             not (self.enable_cache and self.cache_metadata_fpath.exists())
             or has_read_error
@@ -778,97 +823,70 @@ class EnvironmentDataset(Dataset):
 
         return metadata
 
-    def __create_data(self, seq_length_variable):
-        """
-        Materialize the list of sequence descriptors used by __getitem__:
-        [{'group': df, 'env_instance_id': id, 'env_session_id': sid, 'seq_start': i}, ...]
-        """        
-        self.seq_length_current = seq_length_variable
-        self.n_actions = None
-
-        data = []
-        seq_length = seq_length_variable
-
-        if len(self.metadata) == 0:
-            self.n_instances = 0
-            raise ValueError(f"Empty dataset! : {self.name}")
-
-        # build the data list
-        @tqdm_function_decorator(
-            total=math.ceil(len(self.metadata)), disable=len(self.metadata) <= 150
-        )
-        def process_metadata(args):
-            """
-            For one instance, slice each session into fixed-length windows (stride = seq_step),
-            honoring optional session property filters.
-            """            
-            (metadata_key, metadata_entry, seq_length, seq_step, session_filter) = args
-            metadata_entry_groups = metadata_entry.groupby("session_id")
-            if session_filter is not None:
-                metadata_entry_groups = [
-                    (session_id, group)
-                    for key in session_filter.keys()
-                    for session_id, group in metadata_entry_groups
-                    if group.iloc[0][key] in session_filter[key]
-                ]
-
-            data = []
-            for session_id, group in metadata_entry_groups:
-                first_start_id = 0 if self.fsl.fs.start_frame_fpath is None else 1
-                if self.clip_length > 0:
-                    len_group = min(len(group), self.clip_length)
-                else:
-                    len_group = len(group)
-
-                last_start_id = len_group - seq_length
-
-                if last_start_id >= 0:
-                    for i in range(first_start_id, last_start_id, seq_step):
-                        data_entry = {
-                            "group": group,
-                            "env_instance_id": metadata_key,
-                            "env_session_id": session_id,
-                            "seq_start": i,
-                        }
-                        data.append(data_entry)
-            return data
-
-        with ThreadPool(processes=1) as pool:
-            results = pool.imap(
-                process_metadata,
-                [
-                    (
-                        metadata_key,
-                        metadata_entry,
-                        seq_length,
-                        self.seq_step,
-                        self.session_filter,
-                    )
-                    for metadata_key, metadata_entry in self.metadata.items()
-                ],
-                chunksize=500,
-            )
-            data = [entry for sublist in results for entry in sublist]
-
-        return data
 
     def _read_frames(
         self,
-        frame_fpath,
+        fpath,
         start_frame_fpath,
         frame_ids,
         scaling_factor=1,
         transform=None,
+        output_mode="frame",
     ):
         """Read frames from a folder."""
         """
         Read a list of frames (OpenCV) in parallel, resize + BGR→RGB, and apply optional transform.
         Honors `start_frame_fpath` for frame 0 if present. Returns (T,H,W,C) or (T,C,H,W) for PVG.
         """        
+# If dataset was generated as a video, read frames from the session video
+        if output_mode == "video":
+            # Derive session directory from the formatted frame path (which points to .../frames/{:06d}.jpg)
 
+            video_fpath = Path(fpath)
+
+            cap = cv2.VideoCapture(str(video_fpath))
+            if not cap.isOpened():
+                raise ValueError(f"Could not open video file: {video_fpath}")
+
+            frames_list = []
+            for frame_id in frame_ids:
+                # Seek to the exact frame index (keyframe every frame in our generator)
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(frame_id))
+                ret, frame = cap.read()
+                if not ret or frame is None:
+                    cap.release()
+                    raise ValueError(
+                        f"Could not read frame {frame_id} from video {video_fpath}."
+                    )
+
+                frame = cv2.resize(
+                    frame,
+                    (
+                        int(frame.shape[1] * scaling_factor),
+                        int(frame.shape[0] * scaling_factor),
+                    ),
+                    interpolation=cv2.INTER_AREA,
+                )
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB).astype(np.uint8)
+
+                if self.occlusion_mask is not None:
+                    frame = (
+                        frame * (1 - self.occlusion_mask) + self.occlusion_mask * 128
+                    )
+
+                if transform is not None:
+                    frame = transform(frame)
+                frames_list.append(frame)
+
+            cap.release()
+            frames = np.stack(frames_list, axis=0)
+            if self.format == DatasetOutputFormat.PVG:
+                frames = frames.transpose(0, 3, 1, 2)
+            return frames
+
+        # Default path: read from per-frame images
         def worker(frame_id, frame_fpath, scaling_factor=1, transform=None):
             """Read a single frame from a file."""
-            # frame_id += 1 #TODO: fix frame_id+1
             frame = cv2.imread(str(frame_fpath).format(frame_id))
             if frame is None:
                 raise ValueError(
@@ -902,7 +920,7 @@ class EnvironmentDataset(Dataset):
                     (
                         frame_id,
                         (
-                            frame_fpath
+                            fpath
                             if frame_id != 0 or start_frame_fpath is None
                             else start_frame_fpath
                         ),
@@ -919,22 +937,26 @@ class EnvironmentDataset(Dataset):
         return frames
 
     def __getitem__(self, idx):
-        # update data if seq_length_variable has changed, use locking
-        if self.seq_length_variable != self.seq_length_current:
-            with self.lock:
-                if self.seq_length_variable != self.seq_length_current:
-                    unique_str = (
-                        f"{self.fsl.version}_{self.seq_length_input}_{self.seq_step}"
-                    )
-                    self.data = self.__create_data(self.seq_length_variable)
-                    if idx >= len(self.data):
-                        idx = idx % len(self.data)
+        if self.total_windows == 0:
+                    raise IndexError("Empty dataset after indexing")
 
-        entry = self.data[idx]
-        i = entry["seq_start"]
-        seq_metadata_entry = entry["group"].iloc[i : i + self.seq_length_current, :]
-        instance_id = entry["env_instance_id"]
-        session_id = entry["env_session_id"]
+        if self.total_windows <= idx:
+            raise IndexError(
+                f"Index {idx} out of range for dataset of size {self.total_windows}"
+            )
+
+        # idx = idx % self.total_windows
+        sess_idx = int(np.searchsorted(self.cum_windows, idx + 1, side="left"))
+        prev = 0 if sess_idx == 0 else int(self.cum_windows[sess_idx - 1])
+        k = idx - prev
+        sess = self.sessions_info[sess_idx]
+        instance_id = sess["instance_id"]
+        session_id = sess["session_id"]
+        seq_start = sess["first_start"] + k * self.seq_step
+        group = sess["group"]
+        seq_metadata_entry = group.iloc[
+            seq_start : seq_start + self.seq_length_current, :
+        ]
         src_frame_ids = seq_metadata_entry["src_frame_id"].tolist()[
             : self.seq_length_current
         ]
@@ -944,19 +966,35 @@ class EnvironmentDataset(Dataset):
         actions = seq_metadata_entry["action"].to_list()[: self.seq_length_current]
 
         start_frame_fpath = self.fsl[instance_id].start_frame_fpath
-        frame_fpath = self.fsl[instance_id].get_frame_fpath(
-            session_id=session_id, session_props=None, frame_id=None
-        )
+        if self.output_mode == "frame":
+            frame_fpath = self.fsl[instance_id].get_frame_fpath(
+                session_id=session_id, session_props=None, frame_id=None
+            )
 
-        frames = self._read_frames(
-            frame_fpath,
-            start_frame_fpath,
-            src_frame_ids + [tgt_frame_id],
-            scaling_factor=1,
-            transform=(
-                self.transform if self.format != DatasetOutputFormat.PVG else None
-            ),
-        )
+            frames = self._read_frames(
+                frame_fpath,
+                start_frame_fpath,
+                src_frame_ids + [tgt_frame_id],
+                scaling_factor=1,
+                transform=(
+                    self.transform if self.format != DatasetOutputFormat.PVG else None
+                ),
+                output_mode=self.output_mode,
+            )
+        elif self.output_mode == "video":
+            video_fpath = self.fsl[instance_id].get_video_fpath(
+                session_id=session_id, session_props=None
+            )
+            frames = self._read_frames(
+                video_fpath,
+                start_frame_fpath,
+                src_frame_ids + [tgt_frame_id],
+                scaling_factor=1,
+                transform=(
+                    self.transform if self.format != DatasetOutputFormat.PVG else None
+                ),
+                output_mode=self.output_mode,
+            )
 
         # frames = self.jitter_transform(torch.tensor(frames, dtype=torch.float32)).numpy()
 
@@ -965,7 +1003,7 @@ class EnvironmentDataset(Dataset):
 
         actions = np.array([action for action in actions], dtype=np.uint8)
         if self.format == DatasetOutputFormat.IVG:
-            is_first = np.zeros((self.seq_length_variable + 1, 1), dtype=int)
+            is_first = np.zeros((self.seq_length_current + 1, 1), dtype=int)
             is_first[0, :] = np.ones_like(is_first[0, :])
             if np.array(self.info["info"]["action_space"])[-1] > 1:
                 if (
@@ -1045,12 +1083,10 @@ class EnvironmentDataset(Dataset):
         return output
 
     def __len__(self):
-        if self.max_size is not None and self.max_size < len(self.data):
-            return self.max_size
-        return len(self.data)
-
-    def set_observations_count(self, observations_count):
-        self.seq_length_variable = observations_count
+        size = self.total_windows if hasattr(self, "total_windows") else 0
+        if self.max_size is not None and size > self.max_size:
+            size = self.max_size
+        return size
 
     def sample_actions(self, forbidden_actions):
         actions = torch.zeros_like(forbidden_actions)
