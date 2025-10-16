@@ -14,9 +14,10 @@ dynamics:
 
 train:
   dataset_root_dpath: "data_generation/datasets"
-  dataset_name: "retro_act_v0.0.0"
+  dataset_name: "coinrun_v2.0.0" #"retro_act_v0.0.0"
+  # dataset_name: "retro_act_min"
   wandb_name: "genie_redux_guided_pretrain"
-  num_train_steps: 180000
+  num_train_steps: 25000 #180000
   batch_size: 4
   grad_accum: 3
   n_data_workers: 46

@@ -2,8 +2,9 @@ defaults:
   - _self_
   - world_model: default
   - actor_critic: default
-  - env: default
-  - datasets: default
+ # - env: default
+  - datasets: coinrun
+ # - datasets: default
 
 actor_critic:
     use_original_obs: True

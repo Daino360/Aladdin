@@ -1,3 +1,16 @@
+"""
+intrinsic.py: small CNN encoder/decoder blocks and a simple VAE used for
+intrinsic-reward features.
+
+- SmallConvNet: compact ConvNet that maps images (or short frame sequences)
+  to feature vectors; supports (B,C,H,W) or (B,C,T,H,W) input.
+- SmallDeconvNet: lightweight decoder that maps a latent vector back to an image
+  via transposed convolutions (optionally adds a learnable positional bias).
+- VanillaVAE: minimal variational autoencoder built from SmallConvNet encoder
+  (outputs μ and logσ²) and SmallDeconvNet decoder; includes reparameterization,
+  forward pass, and a standard MSE+KL loss.
+"""
+
 from typing import List
 import torch
 import torch.nn as nn
@@ -6,6 +19,17 @@ from einops import rearrange
 from torch import Tensor
 
 class SmallConvNet(nn.Module):
+    """
+    Tiny CNN feature extractor.
+
+    Architecture:
+      Conv(3→32,k=8,s=4) → Conv(32→64,k=4,s=2) → Conv(64→64,k=3,s=1) → FC(1024→feat_dim)
+      Optional BatchNorm/LayerNorm and final nonlinearity.
+
+    Input:
+      - (B, C, H, W) or (B, C, T, H, W). For 5D input, time steps are folded
+        into the batch, encoded, then restored to (B, T, feat_dim).
+    """    
     def __init__(self, feat_dim, last_nl=None, layernormalize=False, batchnorm=False):
         super(SmallConvNet, self).__init__()
         
@@ -29,6 +53,19 @@ class SmallConvNet(nn.Module):
             self.ln = nn.LayerNorm(feat_dim)
 
     def forward(self, x):
+        """
+        Encode image(s) to features.
+
+        Parameters
+        ----------
+        x : Tensor
+          (B,C,H,W) or (B,C,T,H,W); C=3.
+
+        Returns
+        -------
+        Tensor
+          (B,feat_dim) or (B,T,feat_dim) matching input rank.
+        """        
         t = x.size(2)
         enable_5_dims = False
         if x.dim() == 5:
@@ -60,6 +97,15 @@ class SmallConvNet(nn.Module):
  
 
 class SmallDeconvNet(nn.Module):
+    """
+    Small decoder that maps a latent vector to an image via transposed convs.
+
+    Pipeline:
+      FC(latent_dim → 8×8×64) → Deconv(64→128, k4,s2,p1) → Deconv(128→64, k8,s2,p3)
+      → Deconv(64→out_channels, k8,s2,p3) → (optional positional bias).
+
+    Output spatial size depends on strides/padding; caller can crop if needed.
+    """    
     def __init__(self, 
                  latent_dim, 
                  out_channels, 
@@ -116,6 +162,19 @@ class SmallDeconvNet(nn.Module):
         z: (batch_size, latent_dim)  -- same as in TF code.
         Return shape will be (batch_size, out_channels, 84, 84).
         """
+        """
+        Decode latent vectors to images.
+
+        Parameters
+        ----------
+        z : Tensor
+          (B, latent_dim)
+
+        Returns
+        -------
+        Tensor
+          (B, out_channels, H, W) after transposed-conv upsampling.
+        """        
         # FC -> shape: (batch, 8*8*64)
         x = self.fc(z)
         x = F.leaky_relu(x, negative_slope=self.negative_slope)
@@ -149,8 +208,12 @@ class SmallDeconvNet(nn.Module):
 
 
 class VanillaVAE(nn.Module):
+    """
+    Minimal VAE built on SmallConvNet encoder and SmallDeconvNet decoder.
 
-
+    Encoder outputs 2×latent_dim features which are split into μ and logσ².
+    Decoder maps a latent vector back to an image. Loss = MSE(recon,input) + β·KL.
+    """
     def __init__(self,
                  in_channels: int,
                  latent_dim: int,
@@ -223,6 +286,19 @@ class VanillaVAE(nn.Module):
         :param input: (Tensor) Input tensor to encoder [N x C x H x W]
         :return: (Tensor) List of latent codes
         """
+        """
+        Encode an image to Gaussian parameters.
+
+        Parameters
+        ----------
+        input : Tensor
+          (B, C, H, W)
+
+        Returns
+        -------
+        [mu, log_var] : List[Tensor]
+          Each of shape (B, latent_dim)
+        """        
         result = self.encoder(input)
         result = torch.flatten(result, start_dim=1)
 
@@ -240,6 +316,19 @@ class VanillaVAE(nn.Module):
         :param z: (Tensor) [B x D]
         :return: (Tensor) [B x C x H x W]
         """
+        """
+        Decode latent codes to images.
+
+        Parameters
+        ----------
+        z : Tensor
+          (B, latent_dim)
+
+        Returns
+        -------
+        Tensor
+          (B, C, H, W)
+        """
         result = z #self.decoder_input(z)
         result = self.decoder(result)
         
@@ -253,11 +342,30 @@ class VanillaVAE(nn.Module):
         :param logvar: (Tensor) Standard deviation of the latent Gaussian [B x D]
         :return: (Tensor) [B x D]
         """
+        """
+        Sample z via the reparameterization trick: z = μ + σ ⊙ ε.
+
+        Parameters
+        ----------
+        mu : (B, D), logvar : (B, D)  where logvar = log(σ²)
+
+        Returns
+        -------
+        Tensor
+          (B, D) sampled latent vectors
+        """        
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return eps * std + mu
 
     def forward(self, input: Tensor, **kwargs) -> List[Tensor]:
+        """
+        VAE forward pass: encode → reparameterize → decode.
+
+        Returns
+        -------
+        [reconstruction, input, mu, log_var]
+        """        
         mu, log_var = self.encode(input)
         z = self.reparameterize(mu, log_var)
         return  [self.decode(z), input, mu, log_var]
@@ -272,6 +380,19 @@ class VanillaVAE(nn.Module):
         :param kwargs:
         :return:
         """
+        """
+        Compute VAE loss = reconstruction MSE + kld_weight * KL( q(z|x) || N(0,1) ).
+
+        Args list layout from forward():
+          recons, input, mu, log_var
+
+        kwargs:
+          M_N : minibatch scaling factor (β) for the KL term.
+
+        Returns
+        -------
+        dict with keys: 'loss', 'Reconstruction_Loss', 'KLD'
+        """        
         recons = args[0]
         input = args[1]
         mu = args[2]
@@ -296,6 +417,19 @@ class VanillaVAE(nn.Module):
         :param current_device: (Int) Device to run the model
         :return: (Tensor)
         """
+        """
+        Sample images from the prior N(0, I) via the decoder.
+
+        Parameters
+        ----------
+        num_samples : int
+        current_device : int (device index)
+
+        Returns
+        -------
+        Tensor
+          (num_samples, C, H, W)
+        """        
         z = torch.randn(num_samples,
                         self.latent_dim)
 
@@ -310,5 +444,17 @@ class VanillaVAE(nn.Module):
         :param x: (Tensor) [B x C x H x W]
         :return: (Tensor) [B x C x H x W]
         """
+        """
+        Reconstruct input images (i.e., decode(encode(x))).
+
+        Parameters
+        ----------
+        x : (B, C, H, W)
+
+        Returns
+        -------
+        Tensor
+          (B, C, H, W) reconstruction
+        """        
 
         return self.forward(x)[0]

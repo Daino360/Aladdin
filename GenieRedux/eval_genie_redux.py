@@ -1,3 +1,16 @@
+"""
+eval_genie_redux.py: evaluation entrypoint for Genie/Genie-Redux style models.
+
+----------------------
+- Loads a Hydra config and constructs the model (tokenizer or Genie variant).
+- Optionally loads model/tokenizer checkpoints with clear error messages.
+- Builds a multi-environment video dataset and dataloader with proper transforms.
+- Selects an inference method (autoregressive or one-go) and evaluates the model:
+  computes FID, PSNR, SSIM, and optional Delta-PSNR under a control action flip.
+- Saves short visual samples (GIF + PNG) for quick qualitative inspection.
+- Uses Accelerate to handle (single/multi-)device execution and mixed precision.
+"""
+
 import os
 from pathlib import Path
 import hydra
@@ -36,6 +49,20 @@ log = getLogger(__name__)
 
 
 def get_inference_method(model, args, is_distributed=False):
+    """
+    Choose and return the callable used to generate predictions.
+
+    For tokenizer-only runs:
+      - returns the model itself (acts as an autoencoder).
+
+    For Genie models:
+      - "autoregressive": use generate_interactive_video()
+      - "one_go":         use sample()
+
+    Note:
+      The attribute is accessed differently depending on whether the model is
+      wrapped (e.g., by Accelerate/DistributedDataParallel).
+    """    
     if args.model == "tokenizer":
         return model
     if "genie" in args.model:
@@ -54,12 +81,19 @@ def get_inference_method(model, args, is_distributed=False):
 
 
 def convert_index_to_one_hot(index, num_classes):
+    """
+    Convert an integer action index tensor (...,) into one-hot (..., num_classes).
+    """    
     one_hot = torch.zeros((*index.shape, num_classes), device=index.device)
     one_hot.scatter_(-1, index.unsqueeze(-1), 1)
     return one_hot
 
 
 def generate_random_different_action_indices(actions_indices, device, num_actions=7):
+    """
+    Generate random action indices with the same shape as `actions_indices`
+    but guaranteed to differ elementwise (resampling where equal).
+    """    
     shape = actions_indices.shape
     random_actions = torch.randint(0, num_actions, shape, device=device)
 
@@ -82,6 +116,23 @@ def evaluate(
     is_main_process=True,
     is_distributed=False,
 ):
+    """
+    Main evaluation loop.
+
+    Steps (per batch)
+    -----------------
+    1) Prepare actions (optionally override with a fixed action).
+    2) Run the chosen inference method to reconstruct/predict frames.
+    3) Clamp outputs to [0,1] and compute:
+       - FID (updated across batches),
+       - PSNR (sequence-wise),
+       - SSIM (frame-wise, averaged),
+       - (optional) Delta-PSNR by flipping only the last action in a short horizon.
+    4) For the first few batches on the main process, save visualizations
+       (GIF + side-by-side PNG).
+
+    At the end, logs aggregated metrics: FID, PSNR, SSIM, Delta-PSNR.
+    """    
     inference_method = get_inference_method(model, args, is_distributed)
     with torch.no_grad():
         psnr_scores = []
@@ -96,22 +147,26 @@ def evaluate(
                 disable=not is_main_process,
             )
         ):
-
+            
+            # Unpack batch
             actions = videos["actions"]
             videos = videos["input_frames"]
-
+            
+            # Read eval settings
             sample_num_frames = args.eval.sample_num_frames
             delta_psnr_horizon = args.eval.delta_psnr_horizon
             num_first_frames = args.eval.num_first_frames
             dream_length = args.eval.dream_length
             num_actions = args.eval.num_actions
 
+            # Prepare actions: (B, T) indices for prime+pred frames (T-1 actions)            
             actions = actions.to(device)[:, : num_first_frames + sample_num_frames - 1]
             actions = actions.argmax(dim=-1)
 
             if args.eval.action_to_take != -1:
                 actions = actions * 0 + args.eval.action_to_take
 
+            # Prepare videos: (B, C, F, H, W) and split prime frames            
             videos = videos.to(device)[
                 :,
                 : num_first_frames + sample_num_frames,
@@ -120,6 +175,7 @@ def evaluate(
             videos = rearrange(videos, "b f c h w -> b c f h w")
             first_frames = videos[:, :, :num_first_frames]
 
+            # Predict frames with the selected inference method
             recons = inference_method(
                 videos=videos,
                 prime_frames=first_frames,
@@ -130,6 +186,7 @@ def evaluate(
                 return_recons_only=True,
             )
 
+            # Optional: control experiment—change only the last action in a short window
             recons = torch.clamp(recons, min=0, max=1)
             videos = videos[:, :, num_first_frames:]
             recons_random = None
@@ -155,6 +212,8 @@ def evaluate(
                     return_recons_only=True,
                 )
                 recons_random = torch.clamp(recons_random, min=0, max=1)
+                
+                # Compare original vs random-action prediction at the last frame
                 delta_psnr = evaluator.delta_psnr(
                     videos[:, :, delta_psnr_horizon - 1 : delta_psnr_horizon],
                     recons[:, :, delta_psnr_horizon - 1 : delta_psnr_horizon],
@@ -162,6 +221,7 @@ def evaluate(
                 )
                 delta_psnr_scores.append(delta_psnr)
 
+            # Update metrics
             evaluator.fid_update_batch(videos, recons)
 
             psnr = evaluator.psnr(videos, recons)
@@ -174,6 +234,7 @@ def evaluate(
 
             log.i(f"Current scores: {psnr} PSNR; {ssim} SSIM, {delta_psnr} Delta PSNR")
 
+            # Save a few qualitative samples
             if i < 10 and is_main_process:
                 sampled_videos_path = Path(args.eval.save_root_dpath) / f"{args.eval.dataset_name}/{args.eval.model_name}/samples_{i}"
                 (sampled_videos_path).mkdir(parents=True, exist_ok=True)
@@ -209,6 +270,7 @@ def evaluate(
             if is_main_process:
                 log.i(f"Batch {i} Evaluation done!")
 
+    # Aggregate and report final metrics
     psnr_score = torch.mean(torch.tensor(psnr_scores, device=device))
     ssim_score = torch.mean(torch.tensor(ssim_scores, device=device))
     delta_psnr_score = torch.mean(torch.tensor(delta_psnr_scores, device=device))
@@ -225,6 +287,16 @@ def evaluate(
 
 @torch.no_grad()
 def run(args):
+    """
+    Set up evaluation: accelerator, model + (optional) checkpoints, dataset,
+    dataloader, and then call `evaluate`.
+
+    Safety checks:
+    - For non-tokenizer models, require at least one of:
+      * eval.model_fpath (full model),
+      * tokenizer_fpath (tokenizer submodule).
+    - Validate file existence before loading.
+    """    
     dataset_folder = f"{args.eval.dataset_root_dpath}/{args.eval.dataset_name}"
 
     kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
@@ -233,6 +305,7 @@ def run(args):
     device = accelerator.device
     evaluator = Evaluator(device)
 
+    # Build model from config
     model = construct_model(args)
 
     # Harmonized load behavior with training
@@ -274,6 +347,7 @@ def run(args):
             model.load_state_dict(tok_state["model"])  # Tokenizer model
             del tok_state
 
+    # Data transforms and dataset
     transforms = TransformsGenerator.get_final_transforms(model.image_size, None)
     test_data_set = MultiEnvironmentDataset(
         dataset_folder,
@@ -293,6 +367,7 @@ def run(args):
         test_data_set, batch_size=args.eval.batch_size, shuffle=False, num_workers=6
     )
 
+    # Move objects onto devices / wrap for distributed execution
     model, test_loader, evaluator = accelerator.prepare(model, test_loader, evaluator)
 
     is_main_process = accelerator.is_main_process
@@ -305,6 +380,11 @@ def run(args):
 
 @hydra.main(version_base=None, config_path="configs", config_name="default")
 def main(cfg: DictConfig):
+    """
+    Hydra entrypoint:
+    - Loads config from 'configs/default.yaml' (and its overrides).
+    - Calls run(cfg) to execute the evaluation pipeline.
+    """    
     run(cfg)
 
 

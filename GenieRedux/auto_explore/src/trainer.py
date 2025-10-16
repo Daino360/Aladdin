@@ -1,3 +1,16 @@
+"""
+trainer.py: orchestrates data collection, training, evaluation, and checkpointing
+for an AutoExplore agent driven by a GenieRedux world model.
+
+Core responsibilities:
+- Load a trained Genie (tokenizer + dynamics) from disk.
+- Build environments (vectorized), datasets, and collectors for train/eval.
+- Initialize the Actor-Critic policy, optimizer, logging (W&B), and Fabric.
+- Run the epoch loop: collect experience, train the policy, periodically evaluate,
+  save best/last checkpoints, and (optionally) resume from a checkpoint.
+"""
+
+
 from collections import defaultdict
 from functools import partial
 import json
@@ -37,6 +50,19 @@ from tools.logger import getLogger
 log = getLogger(__name__)
 
 def get_game_list(root_dpath):
+    """
+    Load and filter the list of retro games from CSV annotations.
+
+    Parameters
+    ----------
+    root_dpath : str or Path
+        Directory containing 'annotations.csv' and 'controls.csv'.
+
+    Returns
+    -------
+    list
+        Filtered list of game entries (genre == 'pl'); raises if none are found.
+    """
     game_data = GameData(annotation_fpath=os.path.join(root_dpath,"annotations.csv"), control_annotation_fpath=os.path.join(root_dpath, "controls.csv"), enable_sort=True)
     game_data.clean()
     selected_games = game_data.query(genre=["pl"], motion=None, view=None, game=None, platform=None)
@@ -45,6 +71,27 @@ def get_game_list(root_dpath):
     return selected_games
 
 def create_genie(model_fpath:Path, vq_loss_weight, recons_loss_weight):
+    """
+    Construct a GenieReduxGuided world model from a checkpoint directory.
+
+    - Reads a Hydra config (yaml/yml/json) colocated with the checkpoint.
+    - Instantiates and loads the Tokenizer (VQ-VAE-like) and Dynamics (MaskGIT).
+    - Returns a fully loaded GenieReduxGuided ready for inference.
+
+    Parameters
+    ----------
+    model_fpath : Path
+        Path to the saved world model state dict (e.g., '.../model.pt').
+    vq_loss_weight : float
+        VQ loss weight for tokenizer (used for instantiation compatibility).
+    recons_loss_weight : float
+        Reconstruction loss weight for tokenizer (instantiation compatibility).
+
+    Returns
+    -------
+    GenieReduxGuided
+        The loaded world model (tokenizer + dynamics).
+    """
     model_dpath = model_fpath.parent
     # Prefer YAML config exported by GenieRedux training; fallback to JSON if needed
     cfg_fpath = model_dpath / "config.yaml"
@@ -62,7 +109,7 @@ def create_genie(model_fpath:Path, vq_loss_weight, recons_loss_weight):
     cfg_hydra = OmegaConf.load(cfg_fpath)
     config = OmegaConf.to_container(cfg_hydra, resolve=True)
 
-    tokenizer_path = model_dpath / "tokenizer.pt"
+    tokenizer_path = "/home/sdainelli/Aladdin/GenieRedux/checkpoints/GenieRedux_Tokenizer_CoinRun_100mln_v1.0/model.pt" # model_dpath / "tokenizer.pt" #ADDEDBYME
 
     # Read from nested sections: tokenizer and dynamics
     t_cfg = config["tokenizer"]
@@ -150,7 +197,16 @@ def create_genie(model_fpath:Path, vq_loss_weight, recons_loss_weight):
 
 import numpy as np
 class MultiEnvWrapper:
+    # Simple wrapper that randomly switches to a new game on every reset().
     def __init__(self, fn_env_create, games):
+        """
+        Parameters
+        ----------
+        fn_env_create : Callable[..., gym.Env-like]
+            Factory function that builds an environment when given a game entry.
+        games : list
+            Pool of candidate games to sample from.
+        """
         random.seed()
         np.random.seed()
 
@@ -161,20 +217,28 @@ class MultiEnvWrapper:
         self.fn_env_create = fn_env_create
 
     def __getattr__(self, name):
+        # Proxy unknown attributes/methods to the current underlying env.
         return getattr(self.env, name)
 
     def reset(self, **kwargs):
+        # Close current env, sample a new game, rebuild the env, and reset it.
         self.env.close()
         game = random.sample(self.games, 1)[0]
         self.env = self.fn_env_create(game=game)
         return self.env.reset(**kwargs)
 
     def step(self, *args, **kwargs):
+        # Delegate stepping to the current env instance.
         return self.env.step(*args, **kwargs)
 
 
 class Trainer:
+    # High-level training/evaluation orchestrator for AutoExplore + Genie.
     def __init__(self, cfg: DictConfig, fabric: Fabric, fs:FileStructure) -> None:
+        """
+        Set up logging, seeding, devices/paths, world model, policy/optimizer,
+        envs/collectors, and (optionally) resume from a checkpoint.
+        """
 
         wandb_logger = WandbLogger(
             config=OmegaConf.to_container(cfg, resolve=True),
@@ -206,7 +270,8 @@ class Trainer:
 
         self.episode_dir = Path(fs.episodes_dpath)
         self.reconstructions_dir = Path(fs.reconstructions_dpath)
-
+        
+        # First-run setup: persist Hydra config and create dirs (rank 0)
         if not cfg.common.resume:
             config_dir = Path(fs.config_dpath)
             config_dir = config_dir.resolve()
@@ -220,7 +285,8 @@ class Trainer:
                 self.episode_dir.mkdir(exist_ok=False, parents=False)
                 self.reconstructions_dir.mkdir(exist_ok=False, parents=False)
             fabric.barrier()
-
+        
+        # Episode directory managers for saving raw rollouts
         episode_manager_train = EpisodeDirManager(self.episode_dir / 'train', max_num_episodes=cfg.collection.train.num_episodes_to_save)
         episode_manager_test = EpisodeDirManager(self.episode_dir / 'test', max_num_episodes=cfg.collection.test.num_episodes_to_save)
         self.episode_manager_imagination = EpisodeDirManager(self.episode_dir / 'imagination', max_num_episodes=cfg.evaluation.actor_critic.num_episodes_to_save)
@@ -238,11 +304,16 @@ class Trainer:
         valid_action_combos = ["RIGHT", "LEFT", "UP", "DOWN", "ACTION_JUMP"]
 
         def create_env(cfg_env, num_envs, transform=None):
+            """
+            Build a vectorized MultiProcessEnv whose workers each wrap a single
+            game env that switches to a new random game on reset.
+            """            
             games = cfg.collection.games
             max_episode_steps = cfg_env.max_episode_steps
             frame_skip = cfg_env.frame_skip
 
             def make_retro_multi(games):
+                # Factory for a *single* env instance that can switch games.
                 env_fn = partial(
                     make_retro,
                     render_mode="rgb_array",
@@ -254,10 +325,12 @@ class Trainer:
                 return env
             
             fn_make_env = partial(make_retro_multi, games=games)
-
+            
+            # Vectorize across processes; optionally apply transforms
             env = MultiProcessEnv(fn_make_env, num_envs, should_wait_num_envs_ratio=0.5, transform=transform)
             return env
-
+    
+        # Resolve world model checkpoint path (supports numeric IDs)
         model_fname = cfg.world_model.model_fname
         model_dname = cfg.world_model.model_dname
         checkpoint_root_dpath = cfg.world_model.root_dpath
@@ -327,6 +400,12 @@ class Trainer:
             self.load_checkpoint(cfg.common.resume_ckpt_id)
 
     def run(self) -> None:
+        """
+        Main epoch loop:
+        - (Train) Collect experience, train the policy.
+        - (Eval) Periodically collect evaluation rollouts and log metrics.
+        - Save checkpoints (best and periodic), and aggregate optional summaries.
+        """        
         for epoch in range(self.start_epoch, 1 + self.cfg.common.epochs):
 
             if self.fabric.is_global_zero:
@@ -388,6 +467,21 @@ class Trainer:
         """Extract average return from evaluation logs.
         Looks for a key like 'test_dataset/return' and returns its value if found.
         """
+        """
+        Parse evaluation logs to extract the average return value.
+
+        Parameters
+        ----------
+        logs : list[dict]
+            List of metrics dictionaries produced during evaluation.
+        key_prefix : str
+            Prefix of the dataset keys to search (default 'test_dataset/').
+
+        Returns
+        -------
+        float or None
+            The extracted average return, or None if not found/parsable.
+        """
         value = None
         for d in logs:
             for k, v in d.items():
@@ -399,6 +493,13 @@ class Trainer:
         return value
 
     def train_agent(self, epoch: int) -> None:
+        """
+        Train the Actor-Critic component for one epoch (when allowed by config).
+
+        - Puts the policy in train mode (only if past warmup/start epoch).
+        - Calls `train_component` with the appropriate hyperparameters.
+        - Returns aggregated training metrics.
+        """
         self.agent.train()
         self.agent.zero_grad()
 
@@ -420,6 +521,20 @@ class Trainer:
         return [{'epoch': epoch, **metrics_tokenizer, **metrics_world_model, **metrics_actor_critic}]
 
     def train_component(self, component: nn.Module, optimizer: torch.optim.Optimizer, steps_per_epoch: int, batch_num_samples: int, grad_acc_steps: int, max_grad_norm: Optional[float], sequence_length: int, sample_from_start: bool, **kwargs_loss: Any) -> Dict[str, float]:
+        """
+        Generic training loop for a single component (e.g., ActorCritic).
+
+        Logic
+        -----
+        - For `steps_per_epoch` steps:
+            * Perform gradient accumulation over `grad_acc_steps` mini-batches.
+            * Each mini-batch is sampled from the replay dataset with the given
+              `sequence_length` and sampling policy.
+            * Compute component's loss via `compute_loss(**kwargs_loss)`.
+            * Backprop (with Fabric no_backward_sync for accumulation).
+            * Optional gradient clipping, then optimizer.step().
+        - Returns a dict of total and intermediate losses averaged over the epoch.
+        """
         loss_total_epoch = 0.0
         intermediate_losses = defaultdict(float)
         assert batch_num_samples % self.fabric.world_size == 0
@@ -454,6 +569,12 @@ class Trainer:
         return metrics
 
     def _save_checkpoint(self, epoch: int, save_agent_only: bool) -> None:
+        """
+        Serialize training state into the checkpoint directory.
+        - Always save 'last.pt' (agent state dict); every 25 epochs also save '{epoch}.pt'.
+        - Optionally (when not save_agent_only) save epoch number, optimizer state,
+          train dataset checkpoint, and eval dataset book-keeping.
+        """
         if epoch % 25 == 0:
             torch.save(self.agent.state_dict(), self.ckpt_dir / f'{epoch}.pt')
         torch.save(self.agent.state_dict(), self.ckpt_dir / 'last.pt')
@@ -473,6 +594,11 @@ class Trainer:
         self._save_checkpoint(epoch, save_agent_only)
 
     def load_checkpoint(self, ckpt_id = "last") -> None:
+        """
+        Restore training state from disk:
+        - Load epoch index, agent weights (by id: 'last' or an epoch number),
+          optimizer state, and datasets.
+        """
         assert self.ckpt_dir.is_dir()
         self.start_epoch = torch.load(self.ckpt_dir / 'epoch.pt') + 1
         self.agent.load(self.ckpt_dir / f'{ckpt_id}.pt', device=self.device)
