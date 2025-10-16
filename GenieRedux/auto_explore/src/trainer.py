@@ -109,7 +109,7 @@ def create_genie(model_fpath:Path, vq_loss_weight, recons_loss_weight):
     cfg_hydra = OmegaConf.load(cfg_fpath)
     config = OmegaConf.to_container(cfg_hydra, resolve=True)
 
-    tokenizer_path = model_dpath / "tokenizer.pt"
+    tokenizer_path = "/home/sdainelli/Aladdin/GenieRedux/checkpoints/GenieRedux_Tokenizer_CoinRun_100mln_v1.0/model.pt" # model_dpath / "tokenizer.pt" #ADDEDBYME
 
     # Read from nested sections: tokenizer and dynamics
     t_cfg = config["tokenizer"]

@@ -1,3 +1,20 @@
+"""
+lam.py — Latent Action Model (LAM)
+----------------------
+- This module defines `LatentActionModel`, a video encoder–decoder that learns
+  a *discrete* latent action sequence from video using a spatiotemporal ViT
+  backbone (STViViT) plus a vector-quantized (VQ) codebook.
+- Core capabilities:
+  • Encode a video into action tokens (codebook indices) and optionally reconstruct it.
+  • Retrieve action embeddings from codebook indices for downstream models.
+  • Compare reconstructions driven by LAM-predicted actions vs. randomly altered actions.
+
+You’ll typically:
+1) Call `forward(..., return_only_codebook_ids=True)` to get discrete action ids.
+2) Or `forward(..., return_tokens_only=True)` to get per-timestep action embeddings.
+3) Use `get_codes_from_indices` to turn action ids into embeddings.
+"""
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -12,38 +29,52 @@ from models.components import STViViT
 
 
 def exists(val):
+    """Return True if value is not None."""
     return val is not None
 
 
 def default(val, d):
+    """Return `val` if it exists, otherwise fallback to `d`."""
     return val if exists(val) else d
 
 
 def divisible_by(numer, denom):
+    """Return True if `numer` is divisible by `denom` (no remainder)."""
     return (numer % denom) == 0
 
 
 def leaky_relu(p=0.1):
+    """Convenience factory for a LeakyReLU layer with negative slope `p`."""
     return nn.LeakyReLU(p)
 
 
 def pair(val):
+    """Ensure a scalar becomes (val, val); passthrough for 2-tuples."""
     ret = (val, val) if not isinstance(val, tuple) else val
     assert len(ret) == 2
     return ret
 
 
 def cast_tuple(val, l=1):
+    """Return `val` as a tuple of length `l`, repeating if needed."""
     return val if isinstance(val, tuple) else (val,) * l
 
 
+# ============================ #
+# Latent Action Model (LAM)    #
+# ============================ #
 class LatentActionModel(STViViT):
     """
     LatentActionModel class for learning latent representations of actions in video sequences.
-    """
+    Learns discrete latent actions from video with a spatiotemporal ViT encoder and a VQ codebook.
 
-    """
-    einstein notations:
+    Workflow (high level):
+      1) Encode video into patch tokens (first frame + temporally-chunked rest).
+      2) Project to per-timestep action embeddings and quantize via VQ (produce indices).
+      3) (Optional) Add those action embeddings back to frame tokens and decode the video for a
+         reconstruction loss.
+    
+    Einstein notations:
 
     b - batch
     c - channels
@@ -73,7 +104,7 @@ class LatentActionModel(STViViT):
         vq_loss_w=1.0,
     ):
         """
-        Initializes the LatentActionModel.
+        Initializes the LatentActionModel and its STViViT backbone + VQ codebook.
 
         Args:
             dim (int): The feature dimension.
@@ -272,6 +303,17 @@ class LatentActionModel(STViViT):
     # generate random action indices for each of the indices given, but different from those indices themselves. the generated indices shoud be from 0 to codebook_size - 1
 
     def generate_random_different_actions(self, actions_indices, device):
+        """
+        Generate random action indices with the same shape as `actions_indices`,
+        ensuring each sampled index differs from the original at that position.
+
+        Args:
+            actions_indices: LongTensor of shape (B, T) or similar.
+            device: torch device.
+
+        Returns:
+            LongTensor of random indices in [0, codebook_size), not equal to input.
+        """        
         codebook_size = self.codebook_size
         shape = actions_indices.shape
         random_actions = torch.randint(0, codebook_size, shape, device=device)
@@ -286,6 +328,20 @@ class LatentActionModel(STViViT):
         return random_actions
 
     def lam_vs_random_actions(self, video, random_rollout_steps: list[int] = None):
+        """
+        Compare reconstructions using LAM-predicted actions vs. random actions at specified steps.
+
+        Args:
+            video: FloatTensor (B, C, F, H, W).
+            random_rollout_steps: List of timesteps (1..F-1). At each step `k`,
+                                  replace the action at k-1 with a random action,
+                                  decode, and collect the rollout.
+
+        Returns:
+            lam_recon_video: Reconstruction driven by LAM’s own predicted actions.
+            random_rollout_recon_videos: List of reconstructions where one step’s
+                                         action has been replaced with a random one.
+        """        
         assert video.ndim == 5
 
         b, c, f, *image_dims, device = *video.shape, video.device

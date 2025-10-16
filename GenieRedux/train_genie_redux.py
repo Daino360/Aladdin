@@ -12,7 +12,8 @@ from torch.utils.data import Subset
 
 from data.data import (
     DatasetOutputFormat,
-    MultiEnvironmentDataset,
+    # MultiEnvironmentDataset, #ADDEDBYME
+    EnvironmentDataset,
     TransformsGenerator,
 )
 from models import construct_model
@@ -38,7 +39,8 @@ def count_parameters(model):
 
 
 def run(args):
-    dataset_folder = f"{args.train.dataset_root_dpath}/{args.train.dataset_name}"
+    # dataset_folder = f"{args.train.dataset_root_dpath}/{args.train.dataset_name}"
+    dataset_folder = f"{args.train.dataset_root_dpath}/{args.train.dataset_name}/{args.train.dataset_name}" #ADDEDBYME
     # cache_dpath = (
     #     args.train.wandb_dpath if args.train.wandb_dpath != "./wandb" else "./cache"
     # )
@@ -100,6 +102,7 @@ def run(args):
     transforms = TransformsGenerator.get_final_transforms(model.image_size, None)
 
     def get_data_handlers(n_workers=8, n_envs=0, n_total_samples=10000):
+        """
         train_ds_mev = MultiEnvironmentDataset(
             dataset_folder,
             seq_length_input=num_frames - 1,
@@ -113,10 +116,23 @@ def run(args):
             n_workers=n_workers,
             n_envs=n_envs,
         )
+        """
+        train_ds_mev = EnvironmentDataset( #ADDEDBYME
+            dataset_folder,
+            seq_length_input=args.train.num_frames - 1,
+            seq_step=1,
+            split_type="instance",
+            split="train",
+            transform=transforms["train"],
+            format=DatasetOutputFormat.IVG,
+            enable_cache=True,
+            # cache_dpath=f"{cache_dpath}/cache/{args.train.dataset_name}",
+        )
 
-        n_samples_valid = math.ceil(n_total_samples / train_ds_mev.n_datasets)
+        # n_samples_valid = math.ceil(n_total_samples / train_ds_mev.n_datasets) #ADDEDBYME
 
-        valid_ds_mev = MultiEnvironmentDataset(
+        """
+        valid_ds_mev = MultiEnvironmentDataset( #ADDEDBYME
             dataset_folder,
             seq_length_input=num_frames - 1,
             seq_step=20,
@@ -130,6 +146,19 @@ def run(args):
             n_envs=n_envs,
             n_samples=n_samples_valid,
         )
+        """
+        valid_ds_mev = EnvironmentDataset( #ADDEDBYME ho aggiunto _mev in entrambi i ds
+            dataset_folder,
+            seq_length_input=args.train.num_frames - 1,
+            seq_step=args.train.seq_step,
+            split_type="instance",
+            split="validation",
+            transform=transforms["train"],
+            format=DatasetOutputFormat.IVG,
+            enable_cache=True,
+            # cache_dpath=f"{cache_dpath}/cache/{args.train.dataset_name}",
+        )
+        
         valid_ds_mev = Subset(valid_ds_mev, range(n_total_samples))
 
         return train_ds_mev, valid_ds_mev

@@ -1,3 +1,20 @@
+"""
+data.py: multi-environment video dataset utilities + image/video I/O helpers.
+--------------------
+- Tiny helpers for images/videos (PIL↔tensor, GIF read/write, clamping).
+- A simple ImageDataset for plain image folders.
+- Dataset file-structure wrappers to read per-session action JSON and frames.
+- Two dataset variants:
+  * EnvironmentDataset — one environment root; slices fixed-length sequences.
+  * MultiEnvironmentDataset — merges many EnvironmentDataset roots into one view.
+- Optional disk caching of metadata / sequence indices (feather).
+- Multiple output formats (IVG / PVG / LAM / VICREG / GENERAL) for different
+  training setups.
+- TransformsGenerator builds consistent resize/crop (and optional color jitter).
+- EnvironmentDatasetTester quickly visualizes samples to PNGs.
+"""
+
+
 import json
 import logging
 import math
@@ -18,6 +35,8 @@ from torch.utils.data import Dataset, Subset
 from torchvision import transforms
 from torchvision import transforms as T
 from tqdm import tqdm
+
+
 
 from data_generation.data.data import (
     DEFAULT_VERSION,
@@ -44,6 +63,11 @@ def pair(val):
 
 
 def cast_num_frames(t, *, frames):
+    """
+    Pad or trim a (B, F, ...) tensor along the frame dimension to exactly `frames`.
+    - If F > frames: truncate
+    - If F < frames: right-pad with zeros
+    """    
     f = t.shape[1]
 
     if f == frames:
@@ -56,6 +80,7 @@ def cast_num_frames(t, *, frames):
 
 
 def convert_image_to_fn(img_type, image):
+    """Convert a PIL image to a specific mode (e.g., 'RGB') if needed."""
     if image.mode != img_type:
         return image.convert(img_type)
     return image
@@ -65,7 +90,11 @@ def convert_image_to_fn(img_type, image):
 
 
 class ImageDataset(Dataset):
+    """Loads images from a folder and applies a standard resize/crop/flip pipeline."""
     def __init__(self, folder, image_size, exts=["jpg", "jpeg", "png"]):
+        """
+        Scan `folder` recursively for images and prepare torchvision transforms.
+        """        
         super().__init__()
         self.folder = folder
         self.image_size = image_size
@@ -87,6 +116,7 @@ class ImageDataset(Dataset):
         return len(self.paths)
 
     def __getitem__(self, index):
+        """Load one image and apply transforms -> tensor in [0, 1]."""
         path = self.paths[index]
         img = Image.open(path)
         return self.transform(img)
@@ -101,6 +131,10 @@ CHANNELS_TO_MODE = {1: "L", 3: "RGB", 4: "RGBA"}
 
 
 def seek_all_images(img, channels=3):
+    """
+    Iterate all frames in a PIL Image (e.g., GIF), converting to desired mode.
+    Yields PIL images frame-by-frame.
+    """    
     assert channels in CHANNELS_TO_MODE, f"channels {channels} invalid"
     mode = CHANNELS_TO_MODE[channels]
 
@@ -118,6 +152,10 @@ def seek_all_images(img, channels=3):
 
 
 def video_tensor_to_pil_images(tensor, only_first_image=True):
+    """
+    Convert video (C, F, H, W) tensor in [0,1] to PIL image(s).
+    If `only_first_image`, return the first frame; otherwise a horizontal strip.
+    """    
     tensor = torch.clamp(tensor, min=0, max=1)  # clipping underflow and overflow
 
     if only_first_image:
@@ -130,6 +168,10 @@ def video_tensor_to_pil_images(tensor, only_first_image=True):
 def video_tensor_to_gif(
     tensor, path, duration=120, loop=0, optimize=True, actions=None
 ):
+    """
+    Save a (C, F, H, W) video tensor as a GIF at `path`.
+    Returns the sequence of PIL frames used.
+    """
     tensor = torch.clamp(tensor, min=0, max=1)  # clipping underflow and overflow
     images = map(T.ToPILImage(), tensor.unbind(dim=1))
 
@@ -149,12 +191,19 @@ def video_tensor_to_gif(
 
 
 def gif_to_tensor(path, channels=3, transform=T.ToTensor()):
+    """
+    Load a GIF into a (C, F, H, W) tensor using `transform` on each frame.
+    """    
     img = Image.open(path)
     tensors = tuple(map(transform, seek_all_images(img, channels=channels)))
     return torch.stack(tensors, dim=1)
 
 
 def tqdm_function_decorator(total, *args, **kwargs):
+    """
+    Decorator factory that wraps a function and advances a tqdm progress bar
+    every time the function is called.
+    """    
     class PbarFunctionDecorator(object):
         def __init__(self, func):
             self.func = func
@@ -204,14 +253,18 @@ class DatasetOutputFormat:
 
 
 class CombinedEnvironmentDataset(Dataset):
+    """Wrap multiple datasets and interleave their samples uniformly."""
+
     def __init__(self, datasets: List[Dataset]) -> None:
         super().__init__()
         self.datasets = datasets
 
     def __len__(self):
+        """Combined logical length (balanced across component datasets)."""
         return len(self.datasets) * max([len(dataset) for dataset in self.datasets])
 
     def __getitem__(self, idx):
+        """Map global idx to (dataset_id, sample_id) and return the sample."""
         dataset_id = idx % len(self.datasets)
         dataset = self.datasets[dataset_id]
         sample_id = math.floor(idx / len(self.datasets)) % len(dataset)
@@ -220,6 +273,11 @@ class CombinedEnvironmentDataset(Dataset):
 
 
 class MultiEnvironmentDataset(Dataset):
+    """
+    Build an aggregated dataset from many environment roots on disk.
+    Each sub-root is loaded as an EnvironmentDataset (in parallel),
+    optionally whitelisted or limited to the first/last N envs.
+    """    
     def __init__(
         self,
         root_dpath,
@@ -366,6 +424,10 @@ class MultiEnvironmentDataset(Dataset):
         return self.size
 
     def __getitem__(self, idx):
+        """
+        Map a global index to the corresponding dataset & local index, and return
+        that sample.
+        """        
         # find out in which range in cummulative size the idx falls in
         dataset_id = np.argmax(self.cummulative_size > idx)
         new_idx = idx - self.cummulative_size[dataset_id - 1] if dataset_id > 0 else idx
@@ -385,8 +447,22 @@ class MultiEnvironmentDataset(Dataset):
         # self.current_dataset_id = (self.current_dataset_id + 1) % self.n_datasets
         return item
 
+# -----------------------------------------------------------------------------
+# EnvironmentDataset — one environment root
+# -----------------------------------------------------------------------------
 
 class EnvironmentDataset(Dataset):
+    """
+    Sequence dataset backed by DatasetFileStructure with optional caching.
+
+    Flow:
+    - Read dataset `info.json` (action/observation spaces, version, name)
+    - Scan sessions, read per-frame action JSON → DataFrame per instance
+    - Build train/val/test/all split (by instance/session/frame)
+    - Materialize fixed-length sequence descriptors (start, ids, actions, ...)
+    - __getitem__ loads frames in parallel, applies transforms, returns dict
+      in requested format (IVG / PVG / LAM / VICREG / GENERAL)
+    """    
     __DATASET_SPLIT = {
         "train": [0, 0.9],
         "validation": [0.9, 0.99],
@@ -584,6 +660,10 @@ class EnvironmentDataset(Dataset):
         return metadata
 
     def __create_metadata(self):
+        """
+        Build a dict: {instance_id: DataFrame(src_frame_id, tgt_frame_id, action, session_id, ...)}.
+        Uses feather cache when present; otherwise scans sessions and reads action JSON.
+        """        
         has_read_error = False
         if self.enable_cache and self.cache_metadata_fpath.exists():
             self.log.d("Loading metadata from cache... : ", self.cache_metadata_fpath)
@@ -699,6 +779,10 @@ class EnvironmentDataset(Dataset):
         return metadata
 
     def __create_data(self, seq_length_variable):
+        """
+        Materialize the list of sequence descriptors used by __getitem__:
+        [{'group': df, 'env_instance_id': id, 'env_session_id': sid, 'seq_start': i}, ...]
+        """        
         self.seq_length_current = seq_length_variable
         self.n_actions = None
 
@@ -714,6 +798,10 @@ class EnvironmentDataset(Dataset):
             total=math.ceil(len(self.metadata)), disable=len(self.metadata) <= 150
         )
         def process_metadata(args):
+            """
+            For one instance, slice each session into fixed-length windows (stride = seq_step),
+            honoring optional session property filters.
+            """            
             (metadata_key, metadata_entry, seq_length, seq_step, session_filter) = args
             metadata_entry_groups = metadata_entry.groupby("session_id")
             if session_filter is not None:
@@ -773,6 +861,10 @@ class EnvironmentDataset(Dataset):
         transform=None,
     ):
         """Read frames from a folder."""
+        """
+        Read a list of frames (OpenCV) in parallel, resize + BGR→RGB, and apply optional transform.
+        Honors `start_frame_fpath` for frame 0 if present. Returns (T,H,W,C) or (T,C,H,W) for PVG.
+        """        
 
         def worker(frame_id, frame_fpath, scaling_factor=1, transform=None):
             """Read a single frame from a file."""
@@ -974,8 +1066,13 @@ class EnvironmentDataset(Dataset):
 
         return actions
 
+# -----------------------------------------------------------------------------
+# Transforms generator
+# ----------------------------------------------------------------------------
 
 class TransformsGenerator:
+    """Factory for consistent resize/crop + (optional) color jitter + ToTensor."""
+
     @staticmethod
     def color_jitter_transform(
         image: np.ndarray, brightness: int, contrast: int, saturation: int, hue: int
@@ -1046,6 +1143,9 @@ class TransformsGenerator:
 
     @staticmethod
     def pad_to_match_aspect_ratio(image: np.ndarray, target_size: Tuple[int, int]):
+        """
+        Zero-pad an image to match `target_size` aspect ratio (without scaling).
+        """        
         height, width = image.shape[:2]
         target_width, target_height = target_size
 
@@ -1113,6 +1213,9 @@ class TransformsGenerator:
 
     @staticmethod
     def get_evaluation_transforms_config(config) -> Tuple:
+        """
+        Convenience: build train/val/test transforms from config fields.
+        """        
         return TransformsGenerator.get_evaluation_transforms(
             config.data.crop, config.observation_space[config.enc_cnn_keys[0]]
         )
@@ -1213,8 +1316,13 @@ class TransformsGenerator:
             "test": transform,
         }
 
+# -----------------------------------------------------------------------------
+# Quick visual tester
+# -----------------------------------------------------------------------------
 
 class EnvironmentDatasetTester:
+    """Utility to visualize dataset samples as stitched PNGs for sanity checks."""
+
     def __init__(self, dataset: EnvironmentDataset, ouput_dpath):
         self.dataset = dataset
         self.output_dpath = ouput_dpath
@@ -1223,6 +1331,9 @@ class EnvironmentDatasetTester:
             f.unlink()
 
     def visualize(self, idx):
+        """
+        Save a side-by-side PNG of input frames (with action captions) and target frame.
+        """        
         data = self.dataset[idx]
         input_frames = list(data["input_frames"])
         for i in range(len(input_frames)):

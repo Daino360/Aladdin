@@ -1,3 +1,18 @@
+"""
+tokenizer.py — Video Tokenizer (VQ-based spatiotemporal tokenizer)
+----------------------
+- This module defines `Tokenizer`, a spatiotemporal ViT (STViViT) + Vector-Quantization
+  model that:
+  1) Encodes a short video clip into a grid of discrete tokens (codebook indices).
+  2) Decodes those tokens back into video frames.
+- It treats the very first frame separately (no temporal patching), and chunks the
+  remaining frames into temporal patches for efficiency.
+- Typical uses:
+  • Train as an autoencoder: call `forward(videos)` to optimize VQ + reconstruction loss.
+  • Extract tokens: `forward(..., return_only_codebook_ids=True)` to get discrete ids.
+  • Reconstruct: `forward(..., return_recons=True)` to get (loss, reconstruction).
+  • Convert token count ↔ frame count with `num_tokens_per_frames` / `frames_per_num_tokens`.
+"""
 import torch
 import torch.nn.functional as F
 from einops import pack, rearrange, repeat, unpack
@@ -8,29 +23,36 @@ from models.components import STViViT
 # helpers
 
 
+
 def exists(val):
+    """Return True if value is not None."""
     return val is not None
 
 
 def default(val, d):
+    """Return `val` if it exists, otherwise fallback to `d`."""
     return val if exists(val) else d
 
 
 def divisible_by(numer, denom):
+    """Return True if `numer` is divisible by `denom` (no remainder)."""
     return (numer % denom) == 0
 
 
 def leaky_relu(p=0.1):
+    """Convenience factory for a LeakyReLU layer with negative slope `p`."""
     return nn.LeakyReLU(p)
 
 
 def pair(val):
+    """Ensure a scalar becomes (val, val); passthrough for 2-tuples."""
     ret = (val, val) if not isinstance(val, tuple) else val
     assert len(ret) == 2
     return ret
 
 
 def cast_tuple(val, l=1):
+    """Return `val` as a tuple of length `l`, repeating if needed."""
     return val if isinstance(val, tuple) else (val,) * l
 
 
