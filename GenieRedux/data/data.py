@@ -550,7 +550,7 @@ class EnvironmentDataset(Dataset):
         self.actions_shape = self.info["action_space"]
 
         # Determine output mode from generator config (frame vs video). Default to frames.
-        # self.output_mode = str(self.info["generator_config"]["output_mode"]).lower() #ADDEDBYME commentato da me per pretrain
+        self.output_mode = str(self.info["generator_config"]["output_mode"]).lower() #ADDEDBYME commentato da me per pretrain
 
         # Reuse file structure library from a base dataset if it points to the same root
         if source_dataset is not None:

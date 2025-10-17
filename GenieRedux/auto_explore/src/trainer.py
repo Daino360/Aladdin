@@ -109,7 +109,8 @@ def create_genie(model_fpath:Path, vq_loss_weight, recons_loss_weight):
     cfg_hydra = OmegaConf.load(cfg_fpath)
     config = OmegaConf.to_container(cfg_hydra, resolve=True)
 
-    tokenizer_path = "/home/sdainelli/Aladdin/GenieRedux/checkpoints/GenieRedux_Tokenizer_CoinRun_100mln_v1.0/model.pt" # model_dpath / "tokenizer.pt" #ADDEDBYME
+    tokenizer_path =  model_dpath / "tokenizer.pt"
+    # tokenizer_path = "/home/sdainelli/aladdin/GenieRedux/checkpoints/genie_redux_guided/genie_redux_guided_pretrain/tokenizer.pt" #ADDEDBYME
 
     # Read from nested sections: tokenizer and dynamics
     t_cfg = config["tokenizer"]
@@ -155,6 +156,42 @@ def create_genie(model_fpath:Path, vq_loss_weight, recons_loss_weight):
         vq_loss_w=vq_loss_weight,  # vq loss weight
         recon_loss_w=recons_loss_weight,  # reconstruction loss weight
     )
+
+    """# --- Inspect tokenizer ckpt and get vocab size ---
+    tok_sd_all = torch.load(tokenizer_path, map_location="cpu")
+    tok_sd = tok_sd_all.get("model", tok_sd_all)
+    # CoinRun tokenizer usually has key "vq._codebook.embed" shaped [1, vocab, dim]
+    tok_vocab = tok_sd["vq._codebook.embed"].shape[1]
+    print("[Tokenizer] codebook_size:", tok_vocab)
+
+    # --- Inspect world model (genie_guided) ckpt for dynamics shapes ---
+    wm_all = torch.load(model_fpath, map_location="cpu")
+    wm_model = wm_all.get("model", wm_all)
+
+    # Get a dynamics state_dict (handles both nested and flattened cases)
+    if isinstance(wm_model, dict) and "dynamics" in wm_model and isinstance(wm_model["dynamics"], dict):
+        dyn_sd = wm_model["dynamics"]
+    else:
+        # maybe flattened: "dynamics.*"
+        flat = {k[len("dynamics."):]: v for k, v in wm_model.items() if k.startswith("dynamics.")}
+        dyn_sd = flat if flat else wm_model  # last resort: assume already the dynamics sd
+
+    # Helper: print any keys that look like logits or token embeddings
+    candidates = [k for k in dyn_sd.keys() if "to_logits.weight" in k or "token_emb" in k or ("logit" in k and k.endswith("weight"))]
+    print("[Dynamics] key candidates for vocab/hidden dims:")
+    for k in sorted(candidates): 
+        try:
+            print("  ", k, tuple(dyn_sd[k].shape))
+        except Exception:
+            pass
+
+    # If present, "maskgit.to_logits.weight" is [vocab_out, hidden_in]
+    to_logits_key = next((k for k in candidates if k.endswith("to_logits.weight")), None)
+    if to_logits_key:
+        v_out, h_in = dyn_sd[to_logits_key].shape
+        print(f"[Dynamics] to_logits -> vocab_out={v_out}, hidden_in={h_in}")
+    else:
+        print("[Dynamics] 'to_logits.weight' not found; use the printed candidates above to infer shapes manually.")"""
 
     # load the state dict of the tokenizer
     tokenizer_state_dict = torch.load(tokenizer_path, map_location=torch.device('cpu'))

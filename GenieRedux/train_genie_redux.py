@@ -12,8 +12,8 @@ from torch.utils.data import Subset
 
 from data.data import (
     DatasetOutputFormat,
-    # MultiEnvironmentDataset, #ADDEDBYME
-    EnvironmentDataset,
+    MultiEnvironmentDataset, #ADDEDBYME
+    # EnvironmentDataset,
     TransformsGenerator,
 )
 from models import construct_model
@@ -102,7 +102,7 @@ def run(args):
     transforms = TransformsGenerator.get_final_transforms(model.image_size, None)
 
     def get_data_handlers(n_workers=8, n_envs=0, n_total_samples=10000):
-        """
+        
         train_ds_mev = MultiEnvironmentDataset(
             dataset_folder,
             seq_length_input=num_frames - 1,
@@ -116,8 +116,8 @@ def run(args):
             n_workers=n_workers,
             n_envs=n_envs,
         )
-        """
-        train_ds_mev = EnvironmentDataset( #ADDEDBYME
+        
+        """train_ds_mev = EnvironmentDataset( #ADDEDBYME
             dataset_folder,
             seq_length_input=args.train.num_frames - 1,
             seq_step=1,
@@ -127,12 +127,12 @@ def run(args):
             format=DatasetOutputFormat.IVG,
             enable_cache=args.train.enable_cache,
             cache_dpath=args.train.cache_dpath, # Forse non va messo
-        )
+        )"""
 
-        # n_samples_valid = math.ceil(n_total_samples / train_ds_mev.n_datasets) #ADDEDBYME
+        n_samples_valid = math.ceil(n_total_samples / train_ds_mev.n_datasets) #ADDEDBYME
 
-        """
-        valid_ds_mev = MultiEnvironmentDataset( #ADDEDBYME
+        
+        valid_ds_mev = MultiEnvironmentDataset(
             dataset_folder,
             seq_length_input=num_frames - 1,
             seq_step=20,
@@ -159,7 +159,7 @@ def run(args):
             enable_cache=args.train.enable_cache,
             cache_dpath=args.train.cache_dpath,
             source_dataset=train_ds_mev,
-        )
+        )"""
         
         valid_ds_mev = Subset(valid_ds_mev, range(n_total_samples))
 

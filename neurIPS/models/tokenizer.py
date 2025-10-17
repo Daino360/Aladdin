@@ -1,58 +1,38 @@
-"""
-tokenizer.py — Video Tokenizer (VQ-based spatiotemporal tokenizer)
-----------------------
-- This module defines `Tokenizer`, a spatiotemporal ViT (STViViT) + Vector-Quantization
-  model that:
-  1) Encodes a short video clip into a grid of discrete tokens (codebook indices).
-  2) Decodes those tokens back into video frames.
-- It treats the very first frame separately (no temporal patching), and chunks the
-  remaining frames into temporal patches for efficiency.
-- Typical uses:
-  • Train as an autoencoder: call `forward(videos)` to optimize VQ + reconstruction loss.
-  • Extract tokens: `forward(..., return_only_codebook_ids=True)` to get discrete ids.
-  • Reconstruct: `forward(..., return_recons=True)` to get (loss, reconstruction).
-  • Convert token count ↔ frame count with `num_tokens_per_frames` / `frames_per_num_tokens`.
-"""
 import torch
 import torch.nn.functional as F
-from einops import pack, rearrange, repeat, unpack
 from torch import nn
 
+from einops import rearrange, repeat, pack, unpack
+
 from models.components import STViViT
+
 
 # helpers
 
 
-
 def exists(val):
-    """Return True if value is not None."""
     return val is not None
 
 
 def default(val, d):
-    """Return `val` if it exists, otherwise fallback to `d`."""
     return val if exists(val) else d
 
 
 def divisible_by(numer, denom):
-    """Return True if `numer` is divisible by `denom` (no remainder)."""
     return (numer % denom) == 0
 
 
 def leaky_relu(p=0.1):
-    """Convenience factory for a LeakyReLU layer with negative slope `p`."""
     return nn.LeakyReLU(p)
 
 
 def pair(val):
-    """Ensure a scalar becomes (val, val); passthrough for 2-tuples."""
     ret = (val, val) if not isinstance(val, tuple) else val
     assert len(ret) == 2
     return ret
 
 
 def cast_tuple(val, l=1):
-    """Return `val` as a tuple of length `l`, repeating if needed."""
     return val if isinstance(val, tuple) else (val,) * l
 
 
@@ -115,10 +95,8 @@ class Tokenizer(STViViT):
 
     def __init__(
         self,
-        *,
         dim=512,
         codebook_size=1024,
-        # codebook_size=519, #ADDEDBYME
         image_size=64,
         patch_size=4,
         temporal_patch_size=1,
@@ -133,8 +111,6 @@ class Tokenizer(STViViT):
         ff_mult=4.0,
         vq_loss_w=1.0,
         recon_loss_w=1.0,
-        enable_decoder=True,
-        train_decoder_only=False,
     ):
         """
         Initializes the Tokenizer.
@@ -174,10 +150,7 @@ class Tokenizer(STViViT):
             ff_mult=ff_mult,
             vq_loss_w=vq_loss_w,
             recon_loss_w=recon_loss_w,
-            enable_decoder=enable_decoder,
         )
-
-        self.train_decoder_only = train_decoder_only
 
     def calculate_video_token_mask(self, videos, video_frame_mask):
         """
@@ -196,9 +169,7 @@ class Tokenizer(STViViT):
         # Ensure the number of frames (minus the first frame) is divisible by temporal patch size
         assert torch.all(
             ((video_frame_mask.sum(dim=-1) - 1) % self.temporal_patch_size) == 0
-        ), (
-            "number of frames must be divisible by temporal patch size, subtracting off the first frame"
-        )
+        ), "number of frames must be divisible by temporal patch size, subtracting off the first frame"
 
         # Split mask into first frame and rest of the frames
         first_frame_mask, rest_frame_mask = (
@@ -264,9 +235,9 @@ class Tokenizer(STViViT):
         """
         tokens_per_frame = self.image_num_tokens
 
-        assert (num_tokens % tokens_per_frame) == 0, (
-            f"number of tokens must be divisible by number of tokens per frame {tokens_per_frame}"
-        )
+        assert (
+            num_tokens % tokens_per_frame
+        ) == 0, f"number of tokens must be divisible by number of tokens per frame {tokens_per_frame}"
         assert num_tokens > 0
 
         pseudo_frames = num_tokens // tokens_per_frame
@@ -335,9 +306,9 @@ class Tokenizer(STViViT):
         # Validate input dimensions
         assert tuple(image_dims) == self.image_size
         assert not exists(mask) or mask.shape[-1] == f
-        assert divisible_by(f - 1, self.temporal_patch_size), (
-            f"number of frames ({f}) minus one ({f - 1}) must be divisible by temporal patch size ({self.temporal_patch_size})"
-        )
+        assert divisible_by(
+            f - 1, self.temporal_patch_size
+        ), f"number of frames ({f}) minus one ({f - 1}) must be divisible by temporal patch size ({self.temporal_patch_size})"
 
         # Split video into first frame and rest frames
         first_frame, rest_frames = videos[:, :, :1], videos[:, :, 1:]
@@ -363,9 +334,6 @@ class Tokenizer(STViViT):
             vq_mask = self.calculate_video_token_mask(videos, mask)
         tokens, indices, vq_loss = self.vq(tokens, mask=vq_mask)
 
-        if self.train_decoder_only:
-            tokens = tokens.detach()
-
         if return_only_codebook_ids:
             (indices,) = unpack(indices, packed_fhw_shape, "b *")
             return indices
@@ -375,8 +343,9 @@ class Tokenizer(STViViT):
         # Decode tokens
         recon_video = self.decode(tokens)
 
+        returned_recon = recon_video.clone()
+
         if return_recons_only:
-            returned_recon = recon_video
             return returned_recon
 
         # Compute losses
@@ -389,10 +358,7 @@ class Tokenizer(STViViT):
             recon_loss = F.mse_loss(videos, recon_video)
 
         # Combine losses
-        if self.train_decoder_only:
-            loss = self.recon_loss_w * recon_loss
-        else:
-            loss = self.vq_loss_w * vq_loss + self.recon_loss_w * recon_loss
+        loss = self.vq_loss_w * vq_loss + self.recon_loss_w * recon_loss
 
         # Log losses if needed
         if self.wandb_mode != "disabled" and step % log_every == 0:
@@ -405,7 +371,6 @@ class Tokenizer(STViViT):
             )
 
         if return_recons:
-            returned_recon = recon_video
             return loss, returned_recon
 
         return loss

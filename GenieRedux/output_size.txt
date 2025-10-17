@@ -1,0 +1,5 @@
+[Tokenizer] codebook_size: 1024
+[Dynamics] key candidates for vocab/hidden dims:
+   maskgit.to_logits.weight (1024, 519)
+   maskgit.token_emb.weight (1025, 512)
+[Dynamics] to_logits -> vocab_out=1024, hidden_in=519   
