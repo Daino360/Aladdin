@@ -11,6 +11,11 @@
         "is_high_difficulty": false,
         "should_paint_velocity": true,
         "image_size": [64,64],
+
+        
+        "policy_pth": "../model.pth",
+        "device": "cuda:0",
+
         "generator_config": {
             "n_instances": 10000,
             "n_sessions": 1,
