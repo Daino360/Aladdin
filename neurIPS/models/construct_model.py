@@ -32,7 +32,7 @@ def construct_model(config):
 
     if config.model == "tokenizer":
         return tokenizer
-
+    print("Loading tokenizer weights from:", config.tokenizer_fpath)
     tokenizer_state_dict = torch.load(
         config.tokenizer_fpath, map_location=torch.device("cpu")
     )
