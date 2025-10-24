@@ -299,7 +299,7 @@ class Tokenizer(STViViT):
             torch.Tensor or tuple: Loss or tuple of (loss, reconstructions).
         """
         assert videos is not None, "video must be provided"
-        assert videos.ndim == 5
+        assert videos.ndim == 5 #ADDEDBYME messo a 7 come le action dim dei checkpoints
 
         b, c, f, *image_dims, device = *videos.shape, videos.device
 

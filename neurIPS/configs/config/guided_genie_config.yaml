@@ -24,13 +24,13 @@ train:
   num_frames: 16
   sample_num_frames: 15
   seq_step: 16
-  save_root_dpath: "/home/sdainelli/aladdin/neurIPS/checkpoints"
+  save_root_dpath: "/home/sdainelli/Aladdin/neurIPS/checkpoints"
   wandb_mode: "disabled"
 
 eval:
   dataset_root_dpath: "data_generation/datasets"
   dataset_name: "coinrun_v2.0.0"
-  model_fpath: "/home/sdainelli/aladdin/neurIPS/checkpoints/GenieRedux_Guided_CoinRun_80mln_v1.0/model.pt"
+  model_fpath: "/home/sdainelli/Aladdin/neurIPS/checkpoints/GenieRedux_Guided_CoinRun_80mln_v1.0/model.pt"
   batch_size: 1
   num_actions: 5  # CoinRun typically has 5 actions
   num_frames: 16
@@ -39,7 +39,7 @@ eval:
   wandb_mode: "disabled"
   eval_control: "yes"
 
-tokenizer_fpath: "/home/sdainelli/aladdin/neurIPS/checkpoints/GenieRedux_Tokenizer_CoinRun_100mln_v1.0/model.pt"
+tokenizer_fpath: "/home/sdainelli/Aladdin/neurIPS/checkpoints/GenieRedux_Tokenizer_CoinRun_100mln_v1.0/model.pt"
 
 # Tokenizer config
 tokenizer:
@@ -57,8 +57,10 @@ tokenizer:
 
 # Dynamics config for guided model
 dynamics:
+  is_guided: true  # ← THIS IS CRITICAL
+  use_action_embeddings: false  # Set based on your model
   dim: 512
-  action_dim: 5  # CoinRun actions
+  action_dim: 7 #5  # CoinRun actions --> #ADDEDBYME 7 PER MATCHARE IL FILE DYNAMICS.YAML
   image_size: 64
   patch_size: 4
   temporal_patch_size: 1

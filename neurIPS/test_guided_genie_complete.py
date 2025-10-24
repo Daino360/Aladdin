@@ -103,9 +103,10 @@ def calculate_metrics(real_frames, predicted_frames):
 
 def main():
     # PATHS - UPDATE THESE!
-    config_path = "/home/sdainelli/aladdin/neurIPS/configs/config/guided_genie_config.yaml"
-    weights_path = "/home/sdainelli/aladdin/GenieRedux/checkpoints/GenieRedux_Guided_CoinRun_80mln_v1.0/model.pt"  # Update this
-    data_path = "/home/sdainelli/aladdin/neurIPS/data_generation/external/coinrun/ground_truth_data/ground_truth_20251023_173319.npz"  # Update this
+    config_path = "/home/sdainelli/Aladdin/neurIPS/configs/config/guided_genie_config.yaml"
+    # config_path = "/home/sdainelli/Aladdin/GenieRedux/configs/config/guided_genie_config.yaml"
+    weights_path = "/home/sdainelli/Aladdin/neurIPS/checkpoints/GenieRedux_Guided_CoinRun_80mln_v1.0/model.pt"  # Update this
+    data_path = "/home/sdainelli/Aladdin/neurIPS/data_generation/external/coinrun/ground_truth_data/ground_truth_20251024_014408.npz"  # Update this
     
     # Device
     device = 'cuda' if torch.cuda.is_available() else 'cpu'

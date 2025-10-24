@@ -68,7 +68,7 @@ def load_guided_genie_redux(config_path, weights_path, device='cuda' if torch.cu
     # Set critical paths
     if not hasattr(config, 'tokenizer_fpath') or config.tokenizer_fpath is None:
         # Set default tokenizer path
-        config.tokenizer_fpath = "/home/sdainelli/aladdin/neurIPS/checkpoints/GenieRedux_Tokenizer_CoinRun_100mln_v1.0/model.pt"
+        config.tokenizer_fpath = "/home/sdainelli/Aladdin/neurIPS/checkpoints/GenieRedux_Tokenizer_CoinRun_100mln_v1.0/model.pt"
     
     print(f"Model type: {config.model}")
     print(f"Mode: {config.mode}")
@@ -158,55 +158,95 @@ def preprocess_frame_for_genie(frame, target_size=64):
 
 def test_genie_predictions(model, frames, actions, device, num_steps=None, use_open_loop=False):
     """
-    Test the GenieRedux model predictions
-    
-    Args:
-        model: Guided GenieRedux model
-        frames: List of ground truth frames
-        actions: List of actions
-        device: torch device
-        num_steps: Number of steps to predict
-        use_open_loop: If True, use ground truth frames as input (open-loop)
-                      If False, use model predictions (closed-loop)
+    Fixed version with correct action tensor shape
     """
     model.eval()
-    
-    if num_steps is None:
-        num_steps = min(len(frames) - 1, len(actions))
-    
     predictions = []
     
     with torch.no_grad():
-        # Start from first frame
-        current_frame = preprocess_frame_for_genie(frames[0]).to(device).unsqueeze(0)  # [1, C, H, W]
-        
-        for t in range(num_steps):
-            # Get action (ensure it's in valid range)
-            action_val = int(actions[t])
-            action = torch.LongTensor([action_val]).to(device)  # [1]
-            
-            print(f"Step {t+1}/{num_steps}: Action = {action_val}")
+        for t in range(min(num_steps, len(actions))):
+            print(f"  Step {t+1}/{num_steps}: Action = {actions[t]}")
             
             try:
-                # Guided GenieRedux forward pass
-                predicted_frame = model(current_frame, action)
+                # Create a single frame with proper format
+                frame = frames[t]
                 
-                # Convert prediction to numpy for storage
-                predicted_np = predicted_frame.squeeze(0).permute(1, 2, 0).cpu().numpy()
+                # Preprocess frame
+                if isinstance(frame, np.ndarray):
+                    if frame.dtype == np.uint8:
+                        frame = frame.astype(np.float32) / 255.0
+                    frame_tensor = torch.FloatTensor(frame).permute(2, 0, 1)  # [C, H, W]
+                else:
+                    frame_tensor = frame
+                
+                # CORRECT FORMAT: [batch, channels, temporal, height, width]
+                video_input = frame_tensor.unsqueeze(0).unsqueeze(2).to(device)  # [1, 3, 1, 64, 64]
+                
+                # FIX: Action tensor needs proper shape for dynamics
+                # The dynamics expects actions with shape that can be unsqueezed
+                action = torch.LongTensor([[actions[t]]]).to(device)  # [1, 1] instead of [1]
+                
+                print(f"    Input shape: {video_input.shape}")
+                print(f"    Action shape: {action.shape}")
+                
+                # Forward pass
+                output = model(video_input, action)
+                print(f"    Output shape: {output.shape}")
+                
+                # Extract prediction
+                if output.dim() == 5:
+                    if output.shape[1] == 3:  # channels first: [B, C, T, H, W]
+                        predicted_frame = output[0, :, -1]  # Last frame
+                    else:  # temporal first: [B, T, C, H, W] 
+                        predicted_frame = output[0, -1]  # Last frame
+                else:
+                    predicted_frame = output[0]
+                
+                # Convert to numpy for visualization
+                predicted_np = predicted_frame.permute(1, 2, 0).cpu().numpy()
                 predicted_np = (np.clip(predicted_np, 0, 1) * 255).astype(np.uint8)
                 
                 predictions.append(predicted_np)
+                print(f"    ✅ Prediction successful")
                 
-                # Decide what to use as next input
-                if use_open_loop and t + 1 < len(frames):
-                    # Open-loop: use ground truth frame
-                    current_frame = preprocess_frame_for_genie(frames[t + 1]).unsqueeze(0).to(device)
-                else:
-                    # Closed-loop: use model prediction
-                    current_frame = preprocess_frame_for_genie(predicted_np).unsqueeze(0).to(device)
-                    
             except Exception as e:
-                print(f"❌ Error at step {t}: {e}")
-                break
+                print(f"    ❌ Error: {e}")
+                import traceback
+                traceback.print_exc()
+                
+                # Try different action formats
+                try:
+                    print("    Trying different action format...")
+                    frame = frames[t]
+                    if isinstance(frame, np.ndarray):
+                        if frame.dtype == np.uint8:
+                            frame = frame.astype(np.float32) / 255.0
+                        frame_tensor = torch.FloatTensor(frame).permute(2, 0, 1)
+                    else:
+                        frame_tensor = frame
+                    
+                    video_input = frame_tensor.unsqueeze(0).unsqueeze(2).to(device)  # [1, 3, 1, 64, 64]
+                    
+                    # Try action with more dimensions
+                    action = torch.LongTensor([actions[t]]).unsqueeze(0).unsqueeze(0).to(device)  # [1, 1, 1]
+                    
+                    print(f"    Alternative action shape: {action.shape}")
+                    output = model(video_input, action)
+                    print(f"    Output shape: {output.shape}")
+                    
+                    if output.dim() == 5:
+                        predicted_frame = output[0, :, -1] if output.shape[1] == 3 else output[0, -1]
+                    else:
+                        predicted_frame = output[0]
+                    
+                    predicted_np = predicted_frame.permute(1, 2, 0).cpu().numpy()
+                    predicted_np = (np.clip(predicted_np, 0, 1) * 255).astype(np.uint8)
+                    
+                    predictions.append(predicted_np)
+                    print(f"    ✅ Alternative action format worked!")
+                    
+                except Exception as e2:
+                    print(f"    ❌ Alternative also failed: {e2}")
+                    break
     
     return predictions
