@@ -473,6 +473,7 @@ class Dynamics(nn.Module):
         actions=None,
         num_tokens=None,
         patch_shape=None,
+        inference_steps=None, mask_schedule=None, sample_temperature=None, #ADDEDBYME for new goal
         *args,
         **kwargs,
     ):
@@ -505,16 +506,29 @@ class Dynamics(nn.Module):
         mask = torch.ones(shape, device=device, dtype=torch.bool)
 
         scores = None
-        for step in range(self.inference_steps):
+
+        steps = int(inference_steps or self.inference_steps) #ADDEDBYME for new goal
+        sched = mask_schedule or self.mask_schedule #ADDEDBYME for new goal
+        temp  = float(sample_temperature or self.sample_temperature) #ADDEDBYME for new goal
+        
+        for step in range(steps): #(self.inference_steps): #  (steps): ADDEDBYME for new goal
+
+            # mask_ratio = mask_ratio_schedule(ratio, num_tokens, sched)
+            # temperature = temp * ((steps - (step + 1)) / steps)
+
             is_first_step = step == 0
-            is_last_step = step == self.inference_steps - 1
-            steps_til_x0 = self.inference_steps - (step + 1)
+            # is_last_step = step == self.inference_steps - 1
+            is_last_step = step == steps - 1  # ADDEDBYME for new goal
+            # steps_til_x0 = self.inference_steps - (step + 1)
+            steps_til_x0 = self.inference_steps - (step + 1)  # ADDEDBYME for new goal
 
             if not is_first_step:
                 ratio = torch.full(
-                    (1,), (step + 1) / self.inference_steps, device=device
+                    # (1,), (step + 1) / self.inference_steps, device=device
+                    (1,), (step + 1) / steps, device=device
                 )
-                mask_ratio = mask_ratio_schedule(ratio, num_tokens, self.mask_schedule)
+                # mask_ratio = mask_ratio_schedule(ratio, num_tokens, self.mask_schedule)
+                mask_ratio = mask_ratio_schedule(ratio, num_tokens, sched) #ADDEDBYME for new goal
                 num_tokens_mask = int(mask_ratio * num_tokens)
                 _, indices = scores.topk(num_tokens_mask, dim=-1)
                 mask = torch.zeros(shape, device=device).scatter(1, indices, 1).bool()
@@ -535,7 +549,8 @@ class Dynamics(nn.Module):
             )[:, -num_tokens:]
 
             temperature = self.sample_temperature * (
-                steps_til_x0 / self.inference_steps
+                # steps_til_x0 / self.inference_steps
+                steps_til_x0 / steps    #ADDEDBYME for new goal
             )
             pred_video_ids = gumbel_sample(logits, temperature=temperature)
 

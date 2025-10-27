@@ -20,6 +20,6 @@ def download_model(model_name: str, target_dpath: str = "checkpoints") -> str:
     print(f"File downloaded to: {downloaded_file_path}")
     return downloaded_file_path
 
-#download_model("GenieRedux_CoinRun_250mln_v1.0")
+download_model("GenieRedux_CoinRun_250mln_v1.0")
 #download_model("GenieRedux_Guided_CoinRun_80mln_v1.0")
-download_model("GenieRedux_Tokenizer_CoinRun_100mln_v1.0")
+#download_model("GenieRedux_Tokenizer_CoinRun_100mln_v1.0")
