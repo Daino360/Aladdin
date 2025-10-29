@@ -345,6 +345,7 @@ def run_episode(
     out_root: Path,
     dataset_name: str,
     model_name: str,
+    prime_index: int,
 ) -> Path:
     """End-to-end run for a single NPZ episode; returns the output directory path."""
     # 1) Load model and its target image size
@@ -379,7 +380,7 @@ def run_episode(
         )
 
     # 4) Build tensors and optionally use >1 prime frames
-    prime, gt = tensors_from_episode(frames_T_HWC, image_size, device)
+    """prime, gt = tensors_from_episode(frames_T_HWC, image_size, device)
     Fp = max(1, int(num_first_frames))
     if Fp > 1:
         all_frames = torch.cat([prime, gt], dim=2)  # 1 × C × T × H × W
@@ -389,7 +390,40 @@ def run_episode(
         else:
             prime = all_frames[:, :, :Fp]
             gt = all_frames[:, :, Fp:]
-            actions_idx = actions_idx[: gt.shape[2]]
+            actions_idx = actions_idx[: gt.shape[2]]"""
+    # 4) Build tensors and select prime by index (generalized)
+    prime, gt = tensors_from_episode(frames_T_HWC, image_size, device)
+
+    # Reassemble the full timeline: [f0 | f1..f{T-1}] → shape 1×C×T×H×W
+    all_frames = torch.cat([prime, gt], dim=2)
+    total_T = int(all_frames.shape[2])
+    if total_T < 2:
+        raise ValueError(f"Episode too short (T={total_T}); need at least 2 frames.")
+
+    # Clamp P to a valid index (must be ≤ T-2 to have at least one future frame)
+    orig_P = int(prime_index)
+    P = max(0, min(orig_P, total_T - 2))
+    if P != orig_P:
+        print(f"[prime][WARN] prime_index={orig_P} out of range; clamped to {P} (T={total_T}).")
+
+    # Determine how many prime frames to use (window ending at P)
+    Fp = max(1, int(num_first_frames))
+    start = max(0, P - Fp + 1)  # inclusive start index for the prime window
+
+    # Re-slice prime and gt based on P and Fp
+    prime = all_frames[:, :, start:P+1]   # 1 × C × Fp' × H × W  (Fp' can be < Fp near start)
+    gt    = all_frames[:, :, P+1:]        # 1 × C × T_out × H × W
+
+    # Align actions: start from aP and keep exactly T_out actions
+    new_T_out = int(gt.shape[2])
+    if new_T_out <= 0:
+        raise ValueError(f"Chosen prime_index={P} leaves no future frames to predict.")
+    actions_idx = actions_idx[P : P + new_T_out]
+
+    print(f"[prime] using frames [{start}..{P}] as prime (Fp={int(prime.shape[2])}), "
+        f"predicting {new_T_out} frames (P={P}, T={total_T}).")
+
+            
 
     # 5) Inference (chunked)
     preds = chunked_sample(
@@ -445,6 +479,9 @@ def main() -> None:
     ap.add_argument("--dataset_name", type=str, default="coinrun", help="Dataset label for output path")
     ap.add_argument("--model_name", type=str, default="genie_npz", help="Model label for output path")
 
+    ap.add_argument("--prime_index", type=int, default=0, help="0-based index of the last prime frame. " "Default 0 = use the first frame as prime. "
+                    "If --num_first_frames > 1, a window ending at this index is used.")
+
     args = ap.parse_args()
     use_cuda = torch.cuda.is_available() and args.device.startswith("cuda")
     device = torch.device(args.device if use_cuda else "cpu")
@@ -461,6 +498,7 @@ def main() -> None:
         out_root=Path(args.save_root),
         dataset_name=args.dataset_name,
         model_name=args.model_name,
+        prime_index=args.prime_index
     )
     print(f"[Saved] GIF+PNG → {out_dir}")
 

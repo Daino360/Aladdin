@@ -46,7 +46,7 @@
             "console": "integratedTerminal",
             "justMyCode": true // to skip library code
         },
-                {
+        {
             "name": "Python Coinrun Debug",
             //"type": "debugpy",
             "request": "launch",
@@ -55,12 +55,23 @@
             "console": "integratedTerminal",
             "justMyCode": true // to skip library code
         },
-                {
+        {
             "name": "Python GenieReduxUpdated Debug",
             "type": "debugpy",
             "request": "launch",
             "program": "/home/sdainelli/Aladdin/GenieRedux/run.py",
             "args": ["genie_redux","train","config=genie_redux_guided_pretrain.yaml","train.num_processes=4","train.batch_size=4","train.grad_accum=3","tokenizer_fpath=checkpoints/tokenizer/tokenizer/model-150000.pt"],
+            "console": "integratedTerminal",
+            "justMyCode": true // to skip library code
+        },
+        {
+            "name": "Python InferencePPO Debug",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "/home/sdainelli/Aladdin/neurIPS/evaluate_inference_ppo.py",
+            "args": ["--config","/home/sdainelli/Aladdin/neurIPS/configs/config/guided_genie_config.yaml","--model_ckpt","/home/sdainelli/Aladdin/neurIPS/checkpoints/GenieRedux_Guided_CoinRun_80mln_v1.0/model.pt",
+                    "--npz","/home/sdainelli/Aladdin/neurIPS/ground_truth_data/coinrun_ep0999.npz","--inference_steps","32","--num_first_frames","1","--save_root","/home/sdainelli/Aladdin/neurIPS/npz_eval_outputs",
+                    "--dataset_name","coinrun","--model_name","GenieRedux_Guided_CoinRun_80mln_v1.0"],
             "console": "integratedTerminal",
             "justMyCode": true // to skip library code
         }
