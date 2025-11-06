@@ -1,0 +1,12 @@
+{
+  "env": "coinrun",
+  "restore_id": "myrun",
+  "timestamp": "2025-11-04 18:29:44",
+  "action_space_n": 7,
+  "frame_shape_hint": [
+    64,
+    64,
+    3
+  ],
+  "saved_format": "frames[T-16:T], actions[T-16:T-1], T_orig, t_start"
+}

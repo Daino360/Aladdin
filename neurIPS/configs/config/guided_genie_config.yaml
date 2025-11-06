@@ -32,7 +32,7 @@ eval:
   dataset_name: "coinrun_v2.0.0"
   model_fpath: "/home/sdainelli/Aladdin/neurIPS/checkpoints/GenieRedux_Guided_CoinRun_80mln_v1.0/model.pt"
   batch_size: 1
-  num_actions: 5  # CoinRun typically has 5 actions
+  num_actions: 7 #5  # CoinRun typically has 5 actions
   num_frames: 16
   inference_steps: 25
   sample_num_frames: 10
