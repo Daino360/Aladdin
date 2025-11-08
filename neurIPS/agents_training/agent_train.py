@@ -1,145 +1,138 @@
-#!/usr/bin/env python3
 """
-agent_train.py
-=================
+Train PPO (Stable-Baselines3) inside the Genie/GenieRedux world model
+with optical-flow-based rewards.
 
-Summary
--------
-Train a PPO agent **inside a Genie/GenieRedux world model** (Tokenizer + Dynamics),
-treating the world model as the environment. At each step:
-
-    Agent (π) --a_t--> WorldModel.sample(...) --f_{t+1}--> Heuristic Reward --> PPO update
-
-Observations are the world model's **predicted frames** (float HWC in [0,1]).
-Rewards are computed **from the predicted frames** using a simple, robust heuristic:
-
-- First estimate a horizontal position x ∈ [0,1] from an RGB frame via a modal-background
-  segmentation trick (fast, dependency-free).
-- Choose a reward mode:
-    * 'delta': r_t = bucketize( x_{t+1} - x_t )   (recommended; more stationary)
-    * 'abs'  : r_t = bucketize( x_{t+1} )         (can be okay, but less shaped)
-
-Bucketization maps the (small) motion signal into {-2,-1,0,+1,+2} using two thresholds
-(small, large) to reduce reward noise and make returns well-bounded.
-
-This script:
-- Loads Hydra config + checkpoint to build the Genie/GenieRedux model.
-- Builds a small Gym-like Env that calls `model.sample(...)` each step.
-- Vectorizes N copies of the Env (synchronous).
-- Calls your `ppo.py` (PPOConfig + ppo_train) to actually train the policy.
-
-You *are* using `dynamics.py` and `genie_redux.py`: they are used indirectly via
-`construct_model(cfg)` and `model.sample(...)` during every environment step.
+Includes:
+- Fast grayscale optical flow
+- Residual-flow reward (with stuck→jump assist)
+- Flow-odometry + goal (distance-to-goal reduction)
+- Reward stride, downscale, ROI, bottom-bias
+- VecFrameStack(4) and VecNormalize(norm_reward=True)
 """
 
 from __future__ import annotations
 
-from pathlib import Path
-import sys
-ROOT = Path(__file__).resolve().parents[1]  # /home/.../neurIPS
-sys.path.insert(0, str(ROOT))
+import os, glob, argparse, random, time, sys
+from typing import Tuple, Optional
 
-# ---- stdlib
-from dataclasses import dataclass
-from typing import Callable, List, Optional, Tuple
-import argparse
-import glob
-import json
-import math
-import os
-import random
-
-# ---- third-party
-# import gym
+import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
 
-# ---- world model (Genie/GenieRedux)
+import gymnasium as gym
+from gymnasium import spaces
+
+from stable_baselines3 import PPO
+from stable_baselines3.common.env_checker import check_env
+from stable_baselines3.common.monitor import Monitor
+from stable_baselines3.common.vec_env import VecMonitor, VecEnv
+from stable_baselines3.common.vec_env.vec_transpose import VecTransposeImage
+from stable_baselines3.common.vec_env import VecNormalize
+from stable_baselines3.common.vec_env import VecFrameStack
+from stable_baselines3.common.callbacks import CallbackList, BaseCallback
+
+from pathlib import Path
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
 from omegaconf import OmegaConf
 from models import construct_model
 
-# ---- your PPO driver (make sure ppo.py exposes these)
-from ppo import PPOConfig, ppo_train
+
+# =========================
+#  Optical Flow helpers
+# =========================
+
+def _downscale_to_longside(gray: np.ndarray, longside: int) -> np.ndarray:
+    H, W = gray.shape
+    if longside is None:
+        return gray
+    if max(H, W) == longside:
+        return gray
+    s = float(longside) / float(max(H, W))
+    new_size = (max(8, int(W * s)), max(8, int(H * s)))
+    return cv2.resize(gray, new_size, interpolation=cv2.INTER_AREA)
+
+def _flow_residual(prev_gray: np.ndarray, next_gray: np.ndarray, *, longside: int = 64):
+    """Compute Farnebäck flow on grayscale frames and subtract median (camera pan)."""
+    p = _downscale_to_longside(prev_gray, longside)
+    n = _downscale_to_longside(next_gray, longside)
+
+    flow = cv2.calcOpticalFlowFarneback(
+        p, n, None, pyr_scale=0.5, levels=3,
+        winsize=15, iterations=3, poly_n=5, poly_sigma=1.2, flags=0
+    )
+    fx = flow[..., 0]
+    fy = flow[..., 1]
+    fx -= np.median(fx)
+    fy -= np.median(fy)
+    return fx, fy  # residual flow at downscaled resolution
+
+def _roi_weight(H: int, W: int, *, bottom_bias: float, roi: Tuple[float,float,float,float]) -> np.ndarray:
+    """Bottom-biased vertical weights multiplied by an ROI mask."""
+    row = np.linspace(0, 1, H, dtype=np.float32)
+    wv  = 1.0 + (row ** 2) * (bottom_bias - 1.0)  # emphasize bottom
+    wv /= wv.mean()
+    weight = np.repeat(wv[:, None], W, axis=1)
+    y0, y1, x0, x1 = roi
+    iy0, iy1 = int(y0 * H), int(y1 * H)
+    ix0, ix1 = int(x0 * W), int(x1 * W)
+    mask = np.zeros_like(weight, dtype=np.float32)
+    mask[iy0:iy1, ix0:ix1] = 1.0
+    weight *= mask
+    return weight
 
 
-# ============================================================================
-# Heuristic reward helpers
-# ============================================================================
-
-torch.backends.cudnn.benchmark = True
-torch.set_float32_matmul_precision("high")
-
-
-@dataclass
-class XExtractorConfig:
-    """Config for foreground-vs-background heuristic to estimate horizontal position x ∈ [0,1]."""
-    fg_thresh: float = 0.12  # foreground threshold vs modal background color (L2 distance in RGB)
-
-
-def extract_x_naive(frame_hwc_uint8: np.ndarray, cfg: XExtractorConfig = XExtractorConfig()) -> float:
+# -------------------------
+# Residual optical-flow reward (fast GRAY version)
+# -------------------------
+def optical_flow_reward_gray(prev_gray: np.ndarray,
+                             next_gray: np.ndarray,
+                             *,
+                             right_weight: float = 1.0,
+                             jitter_penalty: float = 0.15,
+                             bottom_bias: float = 2.0,
+                             clip: float = 1.0,
+                             downscale: int = 64,
+                             roi: Tuple[float,float,float,float] = (0.55, 1.00, 0.25, 0.75),
+                             stuck_eps: float = 0.010,
+                             jump_bonus_w: float = 0.30,
+                             stuck_jitter_penalty: float = 0.05) -> float:
     """
-    Estimate horizontal position x ∈ [0,1] from an RGB frame (H×W×3, uint8).
-    Method:
-      1) Downsample and compute the modal background color in a coarse 32^3 RGB histogram.
-      2) Foreground = pixels far from that color (L2 distance > fg_thresh).
-      3) Weighted horizontal center of mass (weights favor higher rows).
-    This is fast and robust enough for "go right" reward shaping.
+    Residual optical-flow reward with ROI, bottom bias, and a 'stuck' jump bonus.
+    (Fast: expects grayscale inputs.)
     """
-    img = frame_hwc_uint8.astype(np.float32) / 255.0  # H×W×3, [0,1]
-    H, W, _ = img.shape
-    ds = img[::4, ::4]                # coarse grid to stabilize background
-    if ds.size == 0:
-        return 0.0
+    fx_res, fy_res = _flow_residual(prev_gray, next_gray, longside=downscale)
+    H, W = fx_res.shape
+    weight = _roi_weight(H, W, bottom_bias=bottom_bias, roi=roi)
+    denom = weight.sum() + 1e-9
 
-    # modal background in 32×32×32 histogram
-    bins = (ds * 31).astype(np.int32)
-    flat = bins.reshape(-1, 3)
-    hvals = flat[:, 0] * 32 * 32 + flat[:, 1] * 32 + flat[:, 2]
-    mode_hash = np.bincount(hvals).argmax()
-    br = mode_hash // (32 * 32)
-    bg = (mode_hash // 32) % 32
-    bb = mode_hash % 32
-    bg_color = np.array([br, bg, bb], dtype=np.float32) / 31.0
+    # Forward: background moving LEFT → -fx_res positive
+    forward = float((np.maximum(-fx_res, 0.0) * weight).sum() / denom)
+    # Jitter: residual magnitude
+    jitter = float(np.sqrt(fx_res**2 + fy_res**2).mean())
 
-    # foreground mask = far from modal background
-    dist = np.linalg.norm(img - bg_color[None, None, :], axis=-1)
-    fg = dist > cfg.fg_thresh
-    ys, xs = np.nonzero(fg)
-    if xs.size == 0:
-        return 0.0
+    if forward < stuck_eps:
+        up = float((np.maximum(-fy_res, 0.0) * weight).sum() / denom)  # upward ≈ -fy
+        r = right_weight * forward + jump_bonus_w * up - stuck_jitter_penalty * jitter
+    else:
+        r = right_weight * forward - jitter_penalty * jitter
 
-    # vertical weighting: favor pixels higher in the image (less floor clutter)
-    weights = 1.0 - (ys.astype(np.float32) / max(1, H - 1))
-    x_cm = (xs.astype(np.float32) * weights).sum() / max(1e-6, weights.sum())
-    return float(x_cm / max(1, W - 1))  # normalize to [0,1]
+    return float(np.clip(r, -clip, clip))
 
 
-def bucketize_delta(delta: float, small: float, large: float) -> int:
-    """
-    Map Δx to a discrete reward in {-2,-1,0,+1,+2} using two thresholds:
-
-      +2 if d ≥ +large
-      +1 if +small ≤ d < +large
-       0 if -small < d < +small
-      -1 if -large < d ≤ -small
-      -2 if d ≤ -large
-
-    Suggested defaults: small=0.01, large=0.05. Tune to your frame scale & WM noise.
-    """
-    if delta >=  large: return +2
-    if delta >=  small: return +1
-    if delta >  -small: return 0
-    if delta >  -large: return -1
-    return -2
+def optical_flow_reward(prev_rgb: np.ndarray, next_rgb: np.ndarray, **kw) -> float:
+    """Wrapper that converts RGB→GRAY then calls the fast gray reward."""
+    prev = cv2.cvtColor(prev_rgb, cv2.COLOR_RGB2GRAY)
+    nxt  = cv2.cvtColor(next_rgb,  cv2.COLOR_RGB2GRAY)
+    return optical_flow_reward_gray(prev, nxt, **kw)
 
 
-# ============================================================================
-# Small tensor/image utils
-# ============================================================================
-
+# =========================
+#  Small tensor/image utils
+# =========================
 def _to_chw(img_hwc: np.ndarray) -> torch.Tensor:
-    """Convert HWC np.uint8/float array into CHW float tensor in [0,1]."""
     if img_hwc.dtype not in (np.float32, np.float64):
         x = torch.from_numpy(img_hwc.astype(np.uint8)).permute(2, 0, 1).float() / 255.0
     else:
@@ -148,25 +141,14 @@ def _to_chw(img_hwc: np.ndarray) -> torch.Tensor:
             x = x / 255.0
     return x
 
-
 def _resize_chw(x_chw: torch.Tensor, size_hw: Tuple[int, int]) -> torch.Tensor:
-    """Bilinear resize a CHW tensor to the given (H, W)."""
     return F.interpolate(x_chw.unsqueeze(0), size=size_hw, mode="bilinear", align_corners=False).squeeze(0)
 
 
-# ============================================================================
-# World model loading
-# ============================================================================
-
+# =========================
+#  World model loading
+# =========================
 def load_world_model(cfg_path: str, ckpt_path: str, device: torch.device):
-    """
-    Load Hydra-configured Genie/GenieRedux model and weights.
-    Returns:
-      model:             the constructed model on device in eval() mode
-      image_hw:          (H, W) the expected image size for the model
-      action_dim:        number of discrete actions expected by the model
-      max_frames_per_call: masking budget (for reference; we step 1 frame here)
-    """
     cfg = OmegaConf.load(cfg_path)
     model = construct_model(cfg)
     sd = torch.load(ckpt_path, map_location="cpu")
@@ -193,44 +175,11 @@ def load_world_model(cfg_path: str, ckpt_path: str, device: torch.device):
     return model, (int(image_size[0]), int(image_size[1])), int(action_dim), int(max_frames)
 
 
-# ============================================================================
-# Action mapping (optional)
-# ============================================================================
-
-class ActionMapper:
-    """
-    Map policy action IDs → world model action IDs.
-    Use when your policy’s action space differs from the model’s action_dim.
-    You can pass a JSON mapping, or the preset 'coinrun15_to_7'.
-    """
-    def __init__(self, src_dim: int, dst_dim: int, mapping: Optional[str] = None):
-        self.src_dim, self.dst_dim = int(src_dim), int(dst_dim)
-        if mapping is None and src_dim == dst_dim:
-            self.table = {i: i for i in range(src_dim)}
-        elif mapping == "coinrun15_to_7":
-            groups = [0, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 2, 3, 0]
-            self.table = {i: int(groups[i]) for i in range(len(groups))}
-        else:
-            try:
-                tbl = json.loads(mapping) if mapping is not None else {}
-                self.table = {int(k): int(v) for k, v in tbl.items()}
-            except Exception as e:
-                raise ValueError("Provide JSON mapping or preset 'coinrun15_to_7'") from e
-
-    def __call__(self, a: int) -> int:
-        v = self.table.get(int(a), 0)
-        return max(0, min(self.dst_dim - 1, v))
-
-
-# ============================================================================
-# Prime provider (reset frames)
-# ============================================================================
-
+# =========================
+#  Prime provider
+# =========================
 class PrimeProvider:
-    """
-    Samples an initial (reset) frame from a pool of NPZ episodes and resizes it to the WM size.
-    We use only the first frame of a random NPZ as the starting prime.
-    """
+    """Sample an initial (reset) frame from a pool of NPZ episodes, resized to WM size."""
     def __init__(self, npz_glob: str, image_hw: Tuple[int, int]):
         paths = sorted(glob.glob(npz_glob))
         if not paths:
@@ -244,13 +193,11 @@ class PrimeProvider:
             frames = None
             for k in ["frames", "videos", "input_frames", "obs", "images", "x"]:
                 if k in npz:
-                    frames = npz[k]
-                    break
+                    frames = npz[k]; break
             if frames is None:
                 for k, v in npz.items():
                     if isinstance(v, np.ndarray) and v.ndim >= 3 and 3 in v.shape:
-                        frames = v
-                        break
+                        frames = v; break
             if frames is None:
                 raise RuntimeError(f"No frames found in {p}")
 
@@ -259,11 +206,11 @@ class PrimeProvider:
             if f.ndim == 4:
                 if f.shape[-1] in (1, 3):
                     pass
-                elif f.shape[0] in (1, 3):  # C T H W -> T H W C
-                    f = np.transpose(f, (1, 2, 3, 0))
-                elif f.shape[1] in (1, 3):  # T C H W -> T H W C
-                    f = np.transpose(f, (0, 2, 3, 1))
-            elif f.ndim == 5 and f.shape[0] in (1, 3):  # C T H W (extra dim)
+                elif f.shape[0] in (1, 3):
+                    f = np.transpose(f, (1, 2, 3, 0))  # C T H W -> T H W C
+                elif f.shape[1] in (1, 3):
+                    f = np.transpose(f, (0, 2, 3, 1))  # T C H W -> T H W C
+            elif f.ndim == 5 and f.shape[0] in (1, 3):
                 f = np.transpose(f, (1, 2, 3, 0))
             else:
                 raise RuntimeError(f"Unsupported frames shape in {p}: {frames.shape}")
@@ -279,301 +226,518 @@ class PrimeProvider:
             return (chw.clamp(0, 1) * 255).byte().permute(1, 2, 0).cpu().numpy()
 
 
-# ============================================================================
-# WorldModel-backed Gym Env
-# ============================================================================
+# =========================
+#  Single SB3-compatible Gym Env (kept for check_env)
+# =========================
+class GenieReduxEnv(gym.Env):
+    metadata = {"render_modes": []}
 
-class BatchedWMVecEnv:
-    """
-    Vectorized env that steps the world model for ALL envs in one batched call.
-
-    Observation: (N, H, W, C) float32 in [0,1]
-    Action:      (N,) ints in [0, policy_action_dim-1] → mapped to WM action_dim
-    Reward:      bucketized Δx or absolute x based on `reward_mode`.
-    Auto-resets any env that hits `horizon`, but still returns done=True for PPO.
-    """
-    def __init__(
-        self,
-        wm,                       # your Genie/GenieRedux model
-        device: torch.device,
-        image_hw,                 # (H, W)
-        action_dim: int,          # WM action_dim (e.g., 7)
-        num_envs: int,
-        prime_provider,           # has .sample_prime() -> HWC uint8
-        *,
-        fp: int = 1,
-        horizon: int = 128,
-        inference_steps: int = 8,
-        sample_temperature: float = 1.0,
-        mask_schedule: str = "cosine",
-        reward_mode: str = "delta",     # 'delta' or 'abs'
-        bucket_small: float = 0.01,
-        bucket_large: float = 0.05,
-        action_mapper=None,             # optional callable: policy_id -> wm_id
-    ):
+    def __init__(self,
+                 wm,
+                 device: torch.device,
+                 image_hw: Tuple[int, int],
+                 action_dim: int,
+                 prime_provider: PrimeProvider,
+                 *,
+                 horizon: int = 256,
+                 fp: int = 1,
+                 inference_steps: int = 4,
+                 sample_temperature: float = 1.0,
+                 mask_schedule: str = "cosine"):
+        super().__init__()
         self.wm = wm
         self.dev = device
         self.H, self.W = image_hw
-        self.N = int(num_envs)
-        self.fp = max(1, int(fp))
+        self.A = int(action_dim)
         self.horizon = int(horizon)
+        self.fp = max(1, int(fp))
         self.inf_steps = int(inference_steps)
         self.temp = float(sample_temperature)
         self.mask_schedule = mask_schedule
-        self.reward_mode = reward_mode
-        self.small = float(bucket_small)
-        self.large = float(bucket_large)
-        self.map_action = action_mapper or (lambda a: a)
+        self.provider = prime_provider
 
-        # state
+        self.action_space = spaces.Discrete(self.A)
+        self.observation_space = spaces.Box(low=0, high=255, shape=(self.H, self.W, 3), dtype=np.uint8)
+
         self._t = 0
-        self._x_prev = np.zeros(self.N, dtype=np.float32)
-        self._prime = None  # (N, C, fp, H, W) torch
-        self._last_obs = None  # (N, H, W, C) float
+        self._prime: Optional[torch.Tensor] = None
+        self._last_obs: Optional[np.ndarray] = None
 
-        # build initial primes
-        self._reset_all(prime_provider)
-
-    # ----- public API expected by PPO -----
-    @property
-    def num_envs(self): return self.N
-
-    def reset(self):
-        # return last_obs (normalized floats)
-        return self._last_obs
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self._t = 0
+        f0 = self.provider.sample_prime()
+        chw = _resize_chw(_to_chw(f0), (self.H, self.W))
+        self._prime = chw.unsqueeze(1).to(self.dev)
+        self._last_obs = f0
+        return np.array(f0, copy=True), {}
 
     @torch.no_grad()
-    def step(self, actions_np: np.ndarray):
-        """
-        actions_np: (N,) ints in policy space
-        Returns: obs(N,H,W,C) float32, rew(N,), done(N,), infos(list of dict)
-        """
-        # map to WM action ids
-        a_wm = np.empty_like(actions_np)
-        for i, a in enumerate(actions_np):
-            a_wm[i] = int(self.map_action(int(a)))
-
-        acts = torch.from_numpy(a_wm.reshape(self.N, 1)).to(self.dev, dtype=torch.long)
-
-        # one batched WM call
+    def step(self, action: int):
+        prev = self._last_obs
+        acts = torch.tensor([[int(action)]], device=self.dev, dtype=torch.long)
         preds = self.wm.sample(
-            prime_frames=self._prime,          # (N,C,fp,H,W)
-            actions=acts,                      # (N,1)
+            prime_frames=self._prime.unsqueeze(0),
+            actions=acts,
             num_frames=1,
             inference_steps=self.inf_steps,
             sample_temperature=self.temp,
             mask_schedule=self.mask_schedule,
             return_recons_only=True,
-        )  # (N, C, 1, H, W)
+        )  # (1,C,1,H,W)
 
-        # update prime window
-        self._prime = preds[:, :, -self.fp :]
-
-        # to CPU numpy once (N,H,W,C)
-        chw = preds[:, :, 0]                           # (N,C,H,W)
-        hwc = (chw.clamp(0,1) * 255.0).to(torch.uint8).permute(0,2,3,1).cpu().numpy()
-
-        # rewards
-        x_now = np.zeros(self.N, dtype=np.float32)
-        for i in range(self.N):
-            x_now[i] = extract_x_naive(hwc[i])
-
-        if self.reward_mode == "delta":
-            delta = x_now - self._x_prev
-            rew = np.array([bucketize_delta(float(d), self.small, self.large) for d in delta], dtype=np.float32)
-        else:  # 'abs'
-            # you can also bucketize absolute x if you want; here we leave it continuous in [0,1]
-            rew = x_now.astype(np.float32)
-
-        self._x_prev = x_now
-
-        # time & done
+        self._prime = preds[:, :, -self.fp:][0]  # (C,fp,H,W)
+        nxt = (preds[:, :, 0].clamp(0,1) * 255).to(torch.uint8)[0].permute(1,2,0).cpu().numpy()
+        reward = optical_flow_reward(prev, nxt)
         self._t += 1
-        done = (self._t >= self.horizon) * np.ones(self.N, dtype=bool)
-        infos = [{"x": float(x_now[i])} for i in range(self.N)]
+        truncated = self._t >= self.horizon
+        self._last_obs = nxt
+        if truncated:
+            obs, _ = self.reset()
+            return obs, float(reward), False, True, {}
+        return nxt, float(reward), False, False, {}
 
-        # auto-reset done envs (like your old Vec wrapper)
-        if done.any():
+
+# =========================
+#  Batched VecEnv (with goal shaping option)
+# =========================
+class GenieReduxBatchedVecEnv(VecEnv):
+    """
+    SB3 VecEnv that batches the world-model step and computes rewards:
+      reward_mode:
+        - "flow": residual-flow + stuck→jump (dense, myopic)
+        - "goal": flow-odometry + distance-to-goal reduction (professor's idea)
+        - "hybrid": goal + small progress − jitter
+    """
+    metadata = {"render_modes": []}
+
+    def __init__(self,
+                 wm,
+                 device: torch.device,
+                 image_hw: Tuple[int, int],
+                 action_dim: int,
+                 prime_provider: PrimeProvider,
+                 *,
+                 num_envs: int = 128,
+                 horizon: int = 256,
+                 fp: int = 1,
+                 inference_steps: int = 4,
+                 sample_temperature: float = 1.0,
+                 mask_schedule: str = "cosine",
+                 use_amp: bool = True,
+                 amp_dtype: torch.dtype = torch.bfloat16,
+                 # reward config
+                 reward_mode: str = "goal",         # "flow" | "goal" | "hybrid"
+                 downscale: int = 64,
+                 bottom_bias: float = 2.0,
+                 roi: Tuple[float,float,float,float] = (0.55, 1.00, 0.25, 0.75),
+                 reward_stride: int = 1,
+                 # flow-reward (flow mode)
+                 right_weight: float = 1.0,
+                 jitter_penalty: float = 0.15,
+                 stuck_eps: float = 0.010,
+                 jump_bonus_w: float = 0.30,
+                 stuck_jitter_penalty: float = 0.05,
+                 # goal-reward (goal/hybrid)
+                 goal_weight: float = 1.0,
+                 progress_weight: float = 0.20,
+                 jitter_weight: float = 0.10,
+                 success_bonus: float = 1.0,
+                 goal_radius: float = 0.05):
+        H, W = image_hw
+        self.H, self.W = H, W
+        self.A = int(action_dim)
+        self.N = int(num_envs)
+
+        self.wm = wm
+        self.dev = device
+        self.provider = prime_provider
+        self.horizon = int(horizon)
+        self.fp = max(1, int(fp))
+        self.inf_steps = int(inference_steps)
+        self.temp = float(sample_temperature)
+        self.mask_schedule = mask_schedule
+        self.use_amp = use_amp and (device.type == "cuda")
+        self.amp_dtype = amp_dtype
+
+        # Reward config
+        self.reward_mode = reward_mode
+        self.downscale = downscale
+        self.bottom_bias = bottom_bias
+        self.roi = roi
+        self.reward_stride = max(1, int(reward_stride))
+
+        self.right_weight = right_weight
+        self.jitter_penalty = jitter_penalty
+        self.stuck_eps = stuck_eps
+        self.jump_bonus_w = jump_bonus_w
+        self.stuck_jitter_penalty = stuck_jitter_penalty
+
+        self.goal_weight = goal_weight
+        self.progress_weight = progress_weight
+        self.jitter_weight = jitter_weight
+        self.success_bonus = success_bonus
+        self.goal_radius = goal_radius
+
+        # Odometry state for goal shaping
+        self._xhat = np.zeros(self.N, dtype=np.float32)      # accumulated coordinate
+        self._goal = np.full(self.N, 1.0, dtype=np.float32)  # rightward goal (1 screen)
+        self._prev_dx = np.zeros(self.N, dtype=np.float32)   # optional EMA of dx
+
+        # Reward cache for striding
+        self._rew_cache = np.zeros(self.N, dtype=np.float32)
+
+        observation_space = spaces.Box(low=0, high=255, shape=(H, W, 3), dtype=np.uint8)
+        action_space = spaces.Discrete(self.A)
+        super().__init__(num_envs=self.N, observation_space=observation_space, action_space=action_space)
+
+        self._t = np.zeros(self.N, dtype=np.int32)
+        self._prime = None                  # (N,C,fp,H,W) on device
+        self._last_obs = None               # (N,H,W,3) uint8
+        self._actions_buffer = None
+
+        self._reset_all_slots()
+
+    # ----- VecEnv API -----
+    def reset(self):
+        self._reset_all_slots()
+        return self._last_obs
+
+    def step_async(self, actions):
+        self._actions_buffer = np.asarray(actions, dtype=np.int64)
+
+    def step_wait(self):
+        assert self._actions_buffer is not None
+        prev_obs = self._last_obs
+        acts = torch.from_numpy(self._actions_buffer.reshape(self.N, 1)).to(self.dev, dtype=torch.long)
+
+        with torch.no_grad():
+            if self.use_amp:
+                with torch.cuda.amp.autocast(dtype=self.amp_dtype):
+                    preds = self.wm.sample(
+                        prime_frames=self._prime,
+                        actions=acts,
+                        num_frames=1,
+                        inference_steps=self.inf_steps,
+                        sample_temperature=self.temp,
+                        mask_schedule=self.mask_schedule,
+                        return_recons_only=True,
+                    )
+            else:
+                preds = self.wm.sample(
+                    prime_frames=self._prime,
+                    actions=acts,
+                    num_frames=1,
+                    inference_steps=self.inf_steps,
+                    sample_temperature=self.temp,
+                    mask_schedule=self.mask_schedule,
+                    return_recons_only=True,
+                )
+
+        self._prime = preds[:, :, -self.fp:]
+        nxt = (preds[:, :, 0].clamp(0,1) * 255).to(torch.uint8).permute(0,2,3,1).cpu().numpy()
+
+        # ---- Reward (stride-aware) ----
+        recompute = (self._t % self.reward_stride) == 0
+        if recompute.any():
+            for i in range(self.N):
+                if not recompute[i]:
+                    continue
+                if self.reward_mode == "flow":
+                    # fast gray call
+                    p = cv2.cvtColor(prev_obs[i], cv2.COLOR_RGB2GRAY)
+                    c = cv2.cvtColor(nxt[i],      cv2.COLOR_RGB2GRAY)
+                    r = optical_flow_reward_gray(
+                        p, c,
+                        right_weight=self.right_weight,
+                        jitter_penalty=self.jitter_penalty,
+                        bottom_bias=self.bottom_bias,
+                        clip=1.0,
+                        downscale=self.downscale,
+                        roi=self.roi,
+                        stuck_eps=self.stuck_eps,
+                        jump_bonus_w=self.jump_bonus_w,
+                        stuck_jitter_penalty=self.stuck_jitter_penalty,
+                    )
+                    self._rew_cache[i] = r
+
+                else:
+                    # goal or hybrid: compute residual flow once
+                    p = cv2.cvtColor(prev_obs[i], cv2.COLOR_RGB2GRAY)
+                    c = cv2.cvtColor(nxt[i],      cv2.COLOR_RGB2GRAY)
+                    fx_res, fy_res = _flow_residual(p, c, longside=self.downscale)
+                    H, W = fx_res.shape
+                    weight = _roi_weight(H, W, bottom_bias=self.bottom_bias, roi=self.roi)
+                    denom = weight.sum() + 1e-9
+
+                    # signed forward increment (scene-left positive)
+                    dxf_px = float(((-fx_res) * weight).sum() / denom)
+                    dx_norm = np.clip(dxf_px / W, -0.1, 0.1)  # ~fraction of screen width
+                    # optional EMA:
+                    dx_norm = 0.8 * self._prev_dx[i] + 0.2 * dx_norm
+                    self._prev_dx[i] = dx_norm
+
+                    x_prev = self._xhat[i]
+                    x_cur  = max(0.0, x_prev + dx_norm)
+                    self._xhat[i] = x_cur
+
+                    goal = self._goal[i]
+                    dist_prev = abs(goal - x_prev)
+                    dist_cur  = abs(goal - x_cur)
+                    r_goal = dist_prev - dist_cur  # potential-based distance reduction
+
+                    jitter = float(np.sqrt(fx_res**2 + fy_res**2).mean())
+
+                    if self.reward_mode == "goal":
+                        r = (
+                            self.goal_weight * r_goal
+                            + self.progress_weight * dx_norm
+                            - self.jitter_weight * jitter
+                        )
+                    else:  # "hybrid"
+                        r = (
+                            self.goal_weight * r_goal
+                            + (self.progress_weight * 0.5) * dx_norm
+                            - (self.jitter_weight * 0.5) * jitter
+                        )
+
+                    if dist_cur < self.goal_radius:
+                        r += self.success_bonus
+                        self._goal[i] += 1.0  # curriculum: next screen
+
+                    self._rew_cache[i] = float(np.clip(r, -1.0, 1.0))
+
+        rew = self._rew_cache.copy()
+
+        # Time / done
+        self._t += 1
+        done = (self._t >= self.horizon)
+        infos = [{} for _ in range(self.N)]
+
+        if np.any(done):
             for i in np.where(done)[0]:
-                # re-seed prime with the ORIGINAL reset frame you used last time
-                # simplest: just treat current predicted frame as new start
-                # if you want real resets from NPZ, store the provider and call it here
-                f0 = hwc[i]  # or: provider.sample_prime()
-                chw0 = _resize_chw(_to_chw(f0), (self.H, self.W)).unsqueeze(0).unsqueeze(2).to(self.dev)
-                self._prime[i:i+1] = chw0
-                self._x_prev[i] = extract_x_naive(f0)
-                hwc[i] = f0  # show reset obs right away
+                infos[i]["terminal_observation"] = nxt[i].copy()
+                infos[i]["TimeLimit.truncated"] = True
+                self._reset_slot(i)
+                nxt[i] = self._last_obs[i]
+                self._t[i] = 0
 
-            self._t = 0  # whole batch shares a clock; simplest is to reset when any done
-            # (or keep per-env counters if you prefer; PPO works fine either way)
+        self._last_obs = nxt
+        self._actions_buffer = None
+        return nxt, rew, done, infos
 
-        # store/return normalized floats
-        self._last_obs = hwc.astype(np.float32) / 255.0
-        return self._last_obs, rew, done, infos
+    def close(self):
+        pass
 
-    # ----- internal -----
-    def _reset_all(self, provider):
-        """Initialize all envs’ prime windows from primes, compute first obs/x."""
-        primes_hwc = []
+    # ----- helpers -----
+    def _reset_all_slots(self):
+        primes, last = [], []
         for _ in range(self.N):
-            f0 = provider.sample_prime()      # HWC uint8
-            primes_hwc.append(f0)
+            f0 = self.provider.sample_prime()
+            last.append(f0)
+            primes.append(_resize_chw(_to_chw(f0), (self.H, self.W)))
+        chws = torch.stack(primes, 0)
+        self._prime = chws.unsqueeze(2).to(self.dev)
+        self._last_obs = np.stack(last, 0)
+        self._t[:] = 0
+        self._xhat[:] = 0.0
+        self._goal[:] = 1.0
+        self._prev_dx[:] = 0.0
+        self._rew_cache[:] = 0.0
 
-        # stack to device tensor (N,C,fp,H,W)
-        chws = []
-        for f0 in primes_hwc:
-            chws.append(_resize_chw(_to_chw(f0), (self.H, self.W)))
-        chws = torch.stack(chws, 0)                       # (N,C,H,W)
-        self._prime = chws.unsqueeze(2).to(self.dev)      # Fp=1 to start
+    def _reset_slot(self, i: int):
+        f0 = self.provider.sample_prime()
+        self._last_obs[i] = f0
+        chw = _resize_chw(_to_chw(f0), (self.H, self.W)).to(self.dev)
+        self._prime[i, :, 0] = chw
+        self._xhat[i] = 0.0
+        self._goal[i] = 1.0
+        self._prev_dx[i] = 0.0
+        self._rew_cache[i] = 0.0
 
-        # x_prev and last_obs
-        self._x_prev = np.array([extract_x_naive(f0) for f0 in primes_hwc], dtype=np.float32)
-        self._last_obs = np.stack([(f.astype(np.float32) / 255.0) for f in primes_hwc], 0)
-        self._t = 0 
+    def _indices_to_list(self, indices):
+        if indices is None:
+            return list(range(self.N))
+        if isinstance(indices, (int, np.integer)):
+            return [int(indices)]
+        return list(indices)
+
+    def env_method(self, method_name, *method_args, indices=None, **method_kwargs):
+        idxs = self._indices_to_list(indices)
+        if hasattr(self, method_name) and callable(getattr(self, method_name)):
+            res = getattr(self, method_name)(*method_args, **method_kwargs)
+            return [res for _ in idxs]
+        return [None for _ in idxs]
+
+    def get_attr(self, attr_name, indices=None):
+        idxs = self._indices_to_list(indices)
+        val = getattr(self, attr_name, None)
+        return [val for _ in idxs]
+
+    def set_attr(self, attr_name, value, indices=None):
+        setattr(self, attr_name, value)
+        idxs = self._indices_to_list(indices)
+        return [None for _ in idxs]
+
+    def env_is_wrapped(self, wrapper_class, indices=None):
+        idxs = self._indices_to_list(indices)
+        return [False for _ in idxs]
 
 
-# ============================================================================
-# CLI / main
-# ============================================================================
+# ---- Progress bar + speedometer for SB3 ----
+class TqdmProgressCallback(BaseCallback):
+    def __init__(self, total_timesteps: int, refresh_sec: float = 0.5):
+        super().__init__()
+        self.total = int(total_timesteps)
+        self.refresh = float(refresh_sec)
+        self._pbar = None
+        self._t0 = None
+        self._last_t = None
+        self._last_steps = 0
 
+    def _on_training_start(self) -> None:
+        from tqdm.auto import tqdm
+        self._t0 = self._last_t = time.perf_counter()
+        self._last_steps = 0
+        self._pbar = tqdm(total=self.total, dynamic_ncols=True, smoothing=0.2, desc="PPO training")
+        self._pbar.update(0)
+
+    def _on_step(self) -> bool:
+        now = time.perf_counter()
+        if now - self._last_t < self.refresh:
+            return True
+        steps = int(self.model.num_timesteps)
+        self._pbar.n = min(steps, self.total)
+        dt = now - self._last_t
+        dt_tot = now - self._t0
+        dsteps = steps - self._last_steps
+        sps_inst = dsteps / max(dt, 1e-9)
+        sps_avg = steps / max(dt_tot, 1e-9)
+        eta_s = (self.total - steps) / max(sps_avg, 1e-9)
+        self._pbar.set_postfix(sps=f"{sps_avg:,.0f}", eta=f"{eta_s/60:.1f}m")
+        self._pbar.refresh()
+        self.logger.record("time/sps_avg", sps_avg)
+        self.logger.record("time/sps_inst", sps_inst)
+        self._last_t = now
+        self._last_steps = steps
+        return True
+
+    def _on_training_end(self) -> None:
+        if self._pbar is not None:
+            self._pbar.n = min(int(self.model.num_timesteps), self.total)
+            self._pbar.close()
+
+
+# =========================
+#  Main: train PPO
+# =========================
 def main():
-    """
-    CLI entry:
-      - Loads world model (Hydra YAML + checkpoint).
-      - Builds WM-backed vectorized env with heuristic reward (delta/abs).
-      - Runs PPO training by calling into your ppo.py (ppo_train).
-    """
-    ap = argparse.ArgumentParser("PPO in Genie/GenieRedux World Model (heuristic reward)")
-
-    # World model
-    ap.add_argument("--config", required=True, help="Hydra YAML for the world model")
-    ap.add_argument("--model_ckpt", required=True, help="World model checkpoint (.pt/.pth)")
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True, help="Hydra YAML for world model")
+    ap.add_argument("--ckpt", required=True, help="Checkpoint path")
+    ap.add_argument("--init_npz_glob", required=True, help="Glob with NPZs to sample reset frames")
     ap.add_argument("--device", default="cuda")
 
-    # Initial primes
-    ap.add_argument("--init_npz_glob", required=True, help="Glob to NPZs to sample reset frames")
+    # PPO / vec env
+    ap.add_argument("--n_steps", type=int, default=128)
+    ap.add_argument("--batch_size", type=int, default=2048)
+    ap.add_argument("--n_epochs", type=int, default=8)
+    ap.add_argument("--num_envs", type=int, default=256)
+    ap.add_argument("--horizon", type=int, default=256)
+    ap.add_argument("--total_timesteps", type=int, default=1_000_000)
+    ap.add_argument("--learning_rate", type=float, default=5e-4)
+    ap.add_argument("--ent_coef", type=float, default=0.02)
+    ap.add_argument("--clip_range", type=float, default=0.2)
 
-    # Reward settings
-    ap.add_argument("--reward_mode", choices=["delta", "abs"], default="delta", help="delta: r=Δx; abs: r=x_{t+1} (both bucketized into {-2..+2})")
-    ap.add_argument("--bucket_small", type=float, default=0.01, help="Δx/x threshold for ±1")
-    ap.add_argument("--bucket_large", type=float, default=0.05, help="Δx/x threshold for ±2")
-
-    # Env / WM sampling
-    ap.add_argument("--num_envs", type=int, default=64, help="Parallel envs")
-    ap.add_argument("--horizon", type=int, default=128, help="Episode length inside WM")
-    ap.add_argument("--fp", type=int, default=1, help="Number of prime frames kept by WM")
-    ap.add_argument("--inference_steps", type=int, default=4, help="MaskGIT inference steps per call")
+    # World-model sampling
+    ap.add_argument("--inference_steps", type=int, default=2)
     ap.add_argument("--sample_temperature", type=float, default=1.0)
     ap.add_argument("--mask_schedule", type=str, default="cosine")
 
-    # Action mapping (if policy action_dim != wm.action_dim)
-    ap.add_argument("--policy_action_dim", type=int, default=None, help="If set and != WM actions, map policy actions into WM actions")
-    ap.add_argument("--action_map", type=str, default=None, help="JSON mapping or preset 'coinrun15_to_7'")
+    # Reward config
+    ap.add_argument("--reward_mode", type=str, default="goal", choices=["flow", "goal", "hybrid"])
+    ap.add_argument("--downscale", type=int, default=64)
+    ap.add_argument("--bottom_bias", type=float, default=2.0)
+    ap.add_argument("--reward_stride", type=int, default=1)
 
-    # PPO hyperparameters
-    ap.add_argument("--total_timesteps", type=int, default=200_000) #1_000_000
-    ap.add_argument("--nsteps", type=int, default=64)
-    ap.add_argument("--update_epochs", type=int, default=4)
-    ap.add_argument("--num_minibatches", type=int, default=8)
-    ap.add_argument("--learning_rate", type=float, default=3e-4)
-    ap.add_argument("--gamma", type=float, default=0.99)
-    ap.add_argument("--gae_lambda", type=float, default=0.95)
-    ap.add_argument("--clip_coef", type=float, default=0.2)
-    ap.add_argument("--ent_coef", type=float, default=0.01)
-    ap.add_argument("--vf_coef", type=float, default=0.5)
-    ap.add_argument("--max_grad_norm", type=float, default=0.5)
-    ap.add_argument("--clip_vloss", action="store_true")
-    ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--save_interval", type=int, default=50, help="Save every N PPO updates (set 0 to disable)")
+    # Flow-mode knobs
+    ap.add_argument("--stuck_eps", type=float, default=0.010)
+    ap.add_argument("--jump_bonus_w", type=float, default=0.30)
 
-    ap.add_argument("--out_dir", type=str, default="wm_ppo_runs")
+    # Goal-mode knobs
+    ap.add_argument("--goal_weight", type=float, default=1.0)
+    ap.add_argument("--progress_weight", type=float, default=0.20)
+    ap.add_argument("--jitter_weight", type=float, default=0.10)
+    ap.add_argument("--goal_radius", type=float, default=0.05)
 
+    # Stacking / normalization
+    ap.add_argument("--stack", type=int, default=4)
+    ap.add_argument("--norm_reward", action="store_true", default=True)
+    ap.add_argument("--logdir", type=str, default="runs/genie_sb3_ppoflow")
     args = ap.parse_args()
 
-    # Device
     use_cuda = torch.cuda.is_available() and args.device.startswith("cuda")
     device = torch.device(args.device if use_cuda else "cpu")
 
-    # Load world model once
-    wm, image_hw, wm_action_dim, _ = load_world_model(args.config, args.model_ckpt, device)
+    wm, image_hw, action_dim, _ = load_world_model(args.config, args.ckpt, device)
+    provider = PrimeProvider(args.init_npz_glob, image_hw)
 
-    # Optional action mapper (policy -> WM)
-    mapper = None
-    policy_action_dim = args.policy_action_dim or wm_action_dim
-    if policy_action_dim != wm_action_dim:
-        mapper = ActionMapper(
-            src_dim=policy_action_dim,
-            dst_dim=wm_action_dim,
-            mapping=args.action_map,       # "coinrun15_to_7" or JSON or None
-        )
+    # Sanity check on a single env
+    check_env(Monitor(GenieReduxEnv(
+        wm=wm, device=device, image_hw=image_hw, action_dim=action_dim,
+        prime_provider=provider, horizon=args.horizon,
+        fp=1, inference_steps=args.inference_steps,
+        sample_temperature=args.sample_temperature,
+        mask_schedule=args.mask_schedule
+    )), warn=True, skip_render_check=True)
 
-    # Build vectorized env over the WM
-    prime_provider = PrimeProvider(args.init_npz_glob, image_hw)
-
-    venv = BatchedWMVecEnv(
-        wm=wm,
-        device=device,
-        image_hw=image_hw,
-        action_dim=wm_action_dim,          # WM’s true action space (7)
-        num_envs=args.num_envs,
-        prime_provider=prime_provider,
-        fp=args.fp,
-        horizon=args.horizon,           # or args.max_steps if that’s your flag
-        inference_steps=args.inference_steps,   # keep low: 4–8 is fine
+    # Batched env
+    vec = GenieReduxBatchedVecEnv(
+        wm=wm, device=device, image_hw=image_hw, action_dim=action_dim,
+        prime_provider=provider,
+        num_envs=args.num_envs, horizon=args.horizon,
+        fp=1, inference_steps=args.inference_steps,
         sample_temperature=args.sample_temperature,
         mask_schedule=args.mask_schedule,
-        reward_mode=args.reward_mode,   # "delta" or "abs"
-        bucket_small=args.bucket_small,
-        bucket_large=args.bucket_large,
-        action_mapper=mapper,           # None if policy_action_dim == action_dim
+        use_amp=True, amp_dtype=torch.bfloat16,
+        reward_mode=args.reward_mode,
+        downscale=args.downscale,
+        bottom_bias=args.bottom_bias,
+        reward_stride=args.reward_stride,
+        stuck_eps=args.stuck_eps,
+        jump_bonus_w=args.jump_bonus_w,
+        goal_weight=args.goal_weight,
+        progress_weight=args.progress_weight,
+        jitter_weight=args.jitter_weight,
+        goal_radius=args.goal_radius,
     )
 
+    # Wrappers: monitor → transpose(HWC→CHW) → frame stack → reward normalize
+    vec = VecMonitor(vec)
+    vec = VecTransposeImage(vec)
+    if args.stack and args.stack > 1:
+        vec = VecFrameStack(vec, n_stack=args.stack, channels_order="first")
+    if args.norm_reward:
+        vec = VecNormalize(vec, norm_obs=False, norm_reward=True, clip_reward=5.0)
 
-    # Configure PPO and call your ppo.py
-    cfg = PPOConfig(
-        total_timesteps=args.total_timesteps,
-        nsteps=args.nsteps,
-        update_epochs=args.update_epochs,
-        num_minibatches=args.num_minibatches,
+    model = PPO(
+        "CnnPolicy", vec,
+        n_steps=args.n_steps,
+        batch_size=args.batch_size,
+        n_epochs=args.n_epochs,
         learning_rate=args.learning_rate,
-        gamma=args.gamma,
-        gae_lambda=args.gae_lambda,
-        clip_coef=args.clip_coef,
+        gamma=0.99, gae_lambda=0.95,
+        clip_range=args.clip_range,
         ent_coef=args.ent_coef,
-        vf_coef=args.vf_coef,
-        max_grad_norm=args.max_grad_norm,
-        clip_vloss=args.clip_vloss,
+        verbose=1, tensorboard_log=args.logdir,
     )
 
+    progress_cb = TqdmProgressCallback(total_timesteps=args.total_timesteps, refresh_sec=0.5)
+    callback = CallbackList([progress_cb])
 
-    os.makedirs(args.out_dir, exist_ok=True)
-
-    steps_per_update = cfg.nsteps * venv.num_envs
-    save_every_updates = args.save_interval  # e.g., 50
-
-    def save_fn(step, state):
-        # step is global env-steps consumed so far
-        upd = step // steps_per_update
-        if save_every_updates and (upd % save_every_updates == 0):
-            path = os.path.join(args.out_dir, f"ppo_update{upd:05d}.pt")
-            torch.save(state, path)
-            print(f"[save] {path}")
-
-
-    # PPO expects CHW in the policy; env delivers HWC to ppo_train which will do the conversion.
-    C, H, W = 3, image_hw[0], image_hw[1]
-
-    # >>> This is where we "call ppo.py" <<<
-    policy = ppo_train(
-        venv=venv,
-        device=device,
-        obs_shape=(C, H, W),
-        action_dim=(policy_action_dim or wm_action_dim),
-        cfg=cfg,
-        seed=args.seed,
-        save_fn=save_fn,   # optional; omit if you don’t want periodic saving
-    )
-
+    model.learn(total_timesteps=args.total_timesteps, callback=callback)
+    os.makedirs(args.logdir, exist_ok=True)
+    model.save(os.path.join(args.logdir, f"ppo_genie_{args.reward_mode}"))
 
 if __name__ == "__main__":
     main()
