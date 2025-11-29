@@ -329,7 +329,8 @@ class EpisodeState:
             self.pred_chunks = []
 
 def _prep_episode_state(npz_path: str, model, image_size, device,
-                        num_first_frames: int, prime_index: int) -> EpisodeState:
+                        num_first_frames: int, prime_index: int,
+                        eval_max_frames: Optional[int] = None) -> EpisodeState:
     npz = np.load(npz_path, allow_pickle=True)
     frames_T_HWC, actions_idx, _notes = find_frames_actions(npz)
 
@@ -353,6 +354,12 @@ def _prep_episode_state(npz_path: str, model, image_size, device,
     prime_win = all_frames[:, :, start:P+1]   # 1×C×Fp'×H×W
     gt_after  = all_frames[:, :, P+1:]        # 1×C×T_out×H×W
     T_out = int(gt_after.shape[2])
+
+    # Optional cap on evaluation length (e.g., only first 16 predicted frames)
+    if eval_max_frames is not None:
+        T_out = min(T_out, int(eval_max_frames))
+        gt_after = gt_after[:, :, :T_out]
+
     actions_idx = actions_idx[P : P + T_out]
 
     return EpisodeState(
@@ -368,7 +375,8 @@ def _prep_episode_state(npz_path: str, model, image_size, device,
 def run_directory_batched(model, image_size, ep_paths, device,
                           inference_steps, num_first_frames, sample_temperature,
                           mask_schedule, out_root, dataset_name, model_name,
-                          prime_index, batch_size, skip_existing=False, save_media: bool = True):
+                          prime_index, batch_size, skip_existing=False, save_media: bool = True,
+                          eval_max_frames: Optional[int] = None):
 
     # figure global per-call frame budget
     tokens_per_frame = getattr(model.tokenizer, "image_num_tokens", None)
@@ -436,7 +444,9 @@ def run_directory_batched(model, image_size, ep_paths, device,
                 })
                 continue
             try:
-                st = _prep_episode_state(path, model, image_size, device, num_first_frames, prime_index)
+                st = _prep_episode_state(path, model, image_size, device,
+                                         num_first_frames, prime_index,
+                                         eval_max_frames=eval_max_frames)
                 active.append(st)
             except Exception as e:
                 print(f"[Load ERROR] {path}: {e}")
@@ -517,6 +527,7 @@ def run_episode_with_model(
     actions_random: bool = False,
     seed: int | None = None,
     action_const: int | None = None,
+    eval_max_frames: Optional[int] = None,
 ) -> Tuple[Optional[Path], float, float, int, List[str]]:
     """
     Run a single NPZ episode with a preloaded model.
@@ -570,6 +581,10 @@ def run_episode_with_model(
         prime = all_frames[:, :, start:P+1] # 1×C×Fp'×H×W
         gt    = all_frames[:, :, P+1:]      # 1×C×T_out×H×W
         new_T_out = int(gt.shape[2])
+        if eval_max_frames is not None:
+            new_T_out = min(new_T_out, int(eval_max_frames))
+            gt = gt[:, :, :new_T_out]
+            notes.append(f"eval_max_frames={eval_max_frames}")
         if new_T_out <= 0:
             raise ValueError(f"prime_index={P} leaves no future frames to predict.")
         
@@ -653,6 +668,7 @@ def run_episode(
     dataset_name: str,
     model_name: str,
     prime_index: int,
+    eval_max_frames: Optional[int] = None,
 ) -> Path:
     """Backwards-compatible single-episode path (will load model once)."""
     cfg = load_cfg(cfg_path)
@@ -678,6 +694,7 @@ def run_episode(
         model_name=model_name,
         prime_index=prime_index,
         skip_existing=False,
+        eval_max_frames=eval_max_frames,
     )
     if out_dir is None:
         raise RuntimeError(f"Episode failed: {npz_path}")
@@ -712,6 +729,7 @@ def main() -> None:
     ap.add_argument("--dataset_name", type=str, default="coinrun", help="Dataset label for output path")
     ap.add_argument("--model_name", type=str, default="GenieRedux_Guided_CoinRun_80mln_v1.0", help="Model label for output path")
     ap.add_argument("--metrics_only", action="store_true", help="Only compute metrics and write the CSV summary. Do NOT save GIF/PNG.")
+    ap.add_argument("--eval_max_frames", type=int, default=None, help="Cap the number of predicted/evaluated frames (e.g., 16).")
 
 
     # Prime control
@@ -771,6 +789,7 @@ def main() -> None:
             actions_random=args.actions_random,
             seed=args.seed,  
             action_const=args.action_const, 
+            eval_max_frames=args.eval_max_frames,
         )
         if save_media and out_dir is not None:
             print(f"[Saved] GIF+PNG → {out_dir}")
@@ -803,6 +822,7 @@ def main() -> None:
         batch_size=args.batch_size,
         skip_existing=args.skip_existing and save_media,  # skip_existing only makes sense if saving media
         save_media=save_media,                             # <— NEW
+        eval_max_frames=args.eval_max_frames,
     )
 
     # write summary CSV (same as before)

@@ -267,3 +267,17 @@ pyrightconfig.json
 outputs
 outputs/*
 results
+
+
+# Local artifacts
+logs/
+saved_models/
+
+# neurIPS big outputs
+neurIPS/npz_eval_outputs/
+neurIPS/wm_eval_output/
+neurIPS/agents_training/fromSIMevaloutputs/
+neurIPS/agents_training/fromWMevaloutputs/
+
+# runs
+neurIPS/agents_training/runs/
