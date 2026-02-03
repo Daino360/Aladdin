@@ -4,6 +4,7 @@
 ![Machine Learning](https://img.shields.io/badge/ML-Algorithms-orange)
 ![Deep Learning](https://img.shields.io/badge/DeepLearning-purple)
 ![Generative AI](https://img.shields.io/badge/GenerativeAI-red)
+![Reinforcement Learning](https://img.shields.io/badge/RL-OpenAI_Gym-yellow)
 ![Linux Server](https://img.shields.io/badge/Linux-Server-lightgrey)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
