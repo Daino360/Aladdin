@@ -1,5 +1,12 @@
 # Training Agents in a Generative World Model
 
+![Python](https://img.shields.io/badge/Python-3.10-blue)
+![Machine Learning](https://img.shields.io/badge/ML-Algorithms-orange)
+![Deep Learning](https://img.shields.io/badge/DeepLearning-purple)
+![Generative AI](https://img.shields.io/badge/GenerativeAI-red)
+![Linux Server](https://img.shields.io/badge/Linux-Server-lightgrey)
+![License](https://img.shields.io/badge/license-MIT-green)
+
 This repository contains the code and experiments developed for my thesis on **Reinforcement Learning with World Models**, focusing on **policy transfer from learned environments to simulators** and **cross-domain evaluation**.
 
 ## 📌 Project Overview
